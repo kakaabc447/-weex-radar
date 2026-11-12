@@ -178,6 +178,7 @@ position: relative;
 <div class="status-bar">
 <div><span class="dot loading" id="statusDot"></span><span id="statusText">正在加载行情...</span></div>
 <div style="display:flex;align-items:center;gap:10px">
+<span id="wsStatus">实时：连接中</span>
 <span id="lastUpdate">--</span>
 <button class="btn btn-secondary" style="padding:4px 8px;font-size:12px;" onclick="toggleTheme()" id="themeBtn">🌙 暗</button>
 </div>
@@ -208,7 +209,7 @@ position: relative;
 
 <div class="footer-note">
 行情来源：WEEX 合约公开接口<br>
-结构位判定 · 真实盈亏比挂牌 · 注意风险控制 · v2（波段线 + 失效盖章）
+结构位判定 · 真实盈亏比挂牌 · 注意风险控制 · v3（波段线 + 失效盖章 + 秒级实时）
 </div>
 
 <div class="actions">
@@ -355,8 +356,8 @@ if (soundEnable) initAudio();
 function toggleAuto() {
 autoRefresh =!autoRefresh;
 document.getElementById("autoText").textContent = autoRefresh? "开": "关";
-if (autoRefresh) startTimer();
-else if (timer) { clearInterval(timer); timer = null;}
+if (autoRefresh) { startTimer(); connectWs(); }
+else { if (timer) { clearInterval(timer); timer = null;} disconnectWs(); }
 }
 
 // ===== 记录池操作 =====
@@ -374,922 +375,1119 @@ renderRecordPool();
 
 // ===== 记录有效期（按轨道区分：波段 7 天 / 短线 24 小时） =====
 function ttlFor(r) {
-return r && r.track === "SWING"? SWING_TTL_MS: RECORD_TTL_MS;
+  return r && r.track === "SWING" ? SWING_TTL_MS : RECORD_TTL_MS;
 }
 
 // ===== 渲染记录池 =====
 function renderRecordPool() {
-const wrap = document.getElementById("recordPool");
-if (recordPool.length === 0) {
-wrap.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:6px">暂无存入的有效多/空信号</div>`;
-return;
-}
+  const wrap = document.getElementById("recordPool");
+  if (recordPool.length === 0) {
+    wrap.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:6px">暂无存入的有效多/空信号</div>`;
+    return;
+  }
+  
+  let html = "";
+  for (const item of recordPool) {
+    const isRev = item.type && item.type.includes('逆势');
+    let sideClass = item.side === 'LONG' ? 'long' : 'short';
+    if (isRev) sideClass = 'reversal';
+    
+    let warnClass = item.warnMsg ? "warn" : "";
+    const expired = item.ts && (Date.now() - item.ts > ttlFor(item));
+    if (expired) warnClass += " expired";
+    
+    const getTimeStr = (t) => t ? `<span class="trigger-time">(触碰 ${t})</span>` : "";
+    
+    let revLabel = "";
+    if (isRev) {
+        revLabel = item.side === 'LONG' ? ' (⚠️逆势吃反弹)' : ' (⚠️逆势吃回调)';
+    }
 
-let html = "";
-for (const item of recordPool) {
-const isRev = item.type && item.type.includes('逆势');
-let sideClass = item.side === 'LONG'? 'long': 'short';
-if (isRev) sideClass = 'reversal';
-
-let warnClass = item.warnMsg? "warn": "";
-const expired = item.ts && (Date.now() - item.ts > ttlFor(item));
-if (expired) warnClass += " expired";
-
-const getTimeStr = (t) => t? `<span class="trigger-time">(触碰 ${t})</span>`: "";
-
-let revLabel = "";
-if (isRev) {
-revLabel = item.side === 'LONG'? ' (⚠️逆势吃反弹)': ' (⚠️逆势吃回调)';
-}
-
-html += `
-<div class="record-item ${sideClass} ${warnClass}">
-<div class="record-top">
-<div>
-<span class="record-time">${item.timeStr}</span>
-<span class="record-symbol" style="margin-left:8px; color:${sideClass==='long'?'var(--green)':sideClass==='short'?'var(--red)':'var(--yellow)'}">
-${item.name} ${item.side === 'LONG'? '✅做多': '❌做空'}${revLabel}
-</span>
-</div>
-<button class="btn-danger" onclick="deleteRecord('${item.id}')">删除</button>
-</div>
-
-${item.warnMsg? `<div class="warn-tag">${item.warnMsg}</div>`: ""}
-${item.grade? `<div class="grade-tag">级别：${item.grade}${item.grade === "超短线" && item.netDist!== null && item.netDist!== undefined? ` · 扣费后净距离 ≈ ${item.netDist < 0? "-": ""}${formatPrice(Math.abs(item.netDist))}`: ""}</div>`: ""}
-${item.track === "SWING"? `<div class="swing-tag">波段单</div>`: ""}
-${item.timeInv? `<div class="invalid-tag">已失效 ${item.timeInv}（收盘越线）</div>`: ""}
-${expired? `<div class="expired-tag">已过期（${item.track === "SWING"? "超 7 天": "超 24 小时"}，不再追踪）</div>`: ""}
-
-<div class="meta" style="margin-top:8px">
-<div class="meta-item">
-<div class="label">入场区间</div>
-<div class="value">${item.entryText}</div>
-</div>
-<div class="meta-item">
-<div class="label">止损SL ${getTimeStr(item.timeSL)}</div>
-<div class="value red">${item.stopText}</div>
-</div>
-<div class="meta-item">
-<div class="label">止盈 TP1 ${getTimeStr(item.timeTP1)}</div>
-<div class="value green">${item.tp1Text}</div>
-</div>
-<div class="meta-item">
-<div class="label">止盈 TP2 ${getTimeStr(item.timeTP2)}</div>
-<div class="value green">${item.tp2Text}</div>
-</div>
-<div class="meta-item">
-<div class="label">止盈 TP3 ${getTimeStr(item.timeTP3)}</div>
-<div class="value green">${item.tp3Text}</div>
-</div>
-<div class="meta-item">
-<div class="label">真实盈亏比 / 止损距离</div>
-<div class="value">${item.rr!== undefined && item.rr!== null? item.rr.toFixed(2): "--"}: 1 <span style="color:var(--muted);font-size:10px;font-weight:normal">(${item.riskPct!== undefined && item.riskPct!== null? (item.riskPct*100).toFixed(2)+"%": "--"})</span></div>
-</div>
-</div>
-<div class="reason" style="margin-top:8px; font-size:11px;">触发理由：${item.reasons}</div>
-${item.invalidText? `<div class="reason" style="margin-top:4px; font-size:11px;">失效（收盘）：${item.invalidText} · 止损（触价）：${item.stopText}</div>`: ""}
-</div>
-`;
-}
-wrap.innerHTML = html;
+    html += `
+    <div class="record-item ${sideClass} ${warnClass}">
+      <div class="record-top">
+        <div>
+          <span class="record-time">${item.timeStr}</span>
+          <span class="record-symbol" style="margin-left:8px; color:${sideClass==='long'?'var(--green)':sideClass==='short'?'var(--red)':'var(--yellow)'}">
+            ${item.name} ${item.side === 'LONG' ? '✅做多' : '❌做空'}${revLabel}
+          </span>
+        </div>
+        <button class="btn-danger" onclick="deleteRecord('${item.id}')">删除</button>
+      </div>
+      
+      ${item.warnMsg ? `<div class="warn-tag">${item.warnMsg}</div>` : ""}
+      ${item.grade ? `<div class="grade-tag">级别：${item.grade}${item.grade === "超短线" && item.netDist !== null && item.netDist !== undefined ? ` · 扣费后净距离 ≈ ${item.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(item.netDist))}` : ""}</div>` : ""}
+      ${item.track === "SWING" ? `<div class="swing-tag">波段单</div>` : ""}
+      ${item.timeInv ? `<div class="invalid-tag">已失效 ${item.timeInv}（收盘越线）</div>` : ""}
+      ${expired ? `<div class="expired-tag">已过期（${item.track === "SWING" ? "超 7 天" : "超 24 小时"}，不再追踪）</div>` : ""}
+      
+      <div class="meta" style="margin-top:8px">
+        <div class="meta-item">
+          <div class="label">入场区间</div>
+          <div class="value">${item.entryText}</div>
+        </div>
+        <div class="meta-item">
+          <div class="label">止损SL ${getTimeStr(item.timeSL)}</div>
+          <div class="value red">${item.stopText}</div>
+        </div>
+        <div class="meta-item">
+          <div class="label">止盈 TP1 ${getTimeStr(item.timeTP1)}</div>
+          <div class="value green">${item.tp1Text}</div>
+        </div>
+        <div class="meta-item">
+          <div class="label">止盈 TP2 ${getTimeStr(item.timeTP2)}</div>
+          <div class="value green">${item.tp2Text}</div>
+        </div>
+        <div class="meta-item">
+          <div class="label">止盈 TP3 ${getTimeStr(item.timeTP3)}</div>
+          <div class="value green">${item.tp3Text}</div>
+        </div>
+        <div class="meta-item">
+          <div class="label">真实盈亏比 / 止损距离</div>
+          <div class="value">${item.rr !== undefined && item.rr !== null ? item.rr.toFixed(2) : "--"} : 1 <span style="color:var(--muted);font-size:10px;font-weight:normal">(${item.riskPct !== undefined && item.riskPct !== null ? (item.riskPct*100).toFixed(2)+"%" : "--"})</span></div>
+        </div>
+      </div>
+      <div class="reason" style="margin-top:8px; font-size:11px;">触发理由：${item.reasons}</div>
+      ${item.invalidText ? `<div class="reason" style="margin-top:4px; font-size:11px;">失效（收盘）：${item.invalidText} · 止损（触价）：${item.stopText}</div>` : ""}
+    </div>
+    `;
+  }
+  wrap.innerHTML = html;
 }
 
 // ===== 实盘追踪判定（用 5M K 线高低价判定触碰，比轮询现价更能抓住插针） =====
 function checkRecordTriggers(symbolId, currentPrice, barHigh, barLow) {
-if (!currentPrice || currentPrice <= 0) return false;
-const now = new Date().toLocaleTimeString("zh-CN", { hour12: false});
-const hi = Math.max(currentPrice, barHigh || currentPrice);
-const lo = Math.min(currentPrice, barLow || currentPrice);
-let changed = false;
+  if (!currentPrice || currentPrice <= 0) return false;
+  const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const hi = Math.max(currentPrice, barHigh || currentPrice);
+  const lo = Math.min(currentPrice, barLow || currentPrice);
+  let changed = false;
 
-for (const r of recordPool) {
-if (r.symbolId!== symbolId) continue;
-if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
-const isLong = r.side === 'LONG';
-
-const hitSL =!r.timeSL && (isLong? lo <= r.stopVal: hi >= r.stopVal);
-if (hitSL) {
-r.timeSL = now; changed = true;
-}
-// 同一根 K 线内止损与止盈同时触碰：顺序无法判定，按止损先到（保守口径），本轮不盖止盈章
-if (!hitSL) {
-if (!r.timeTP1 && r.tp1Val) {
-if ((isLong && hi >= r.tp1Val) || (!isLong && lo <= r.tp1Val)) {
-r.timeTP1 = now; changed = true;
-}
-}
-if (!r.timeTP2 && r.tp2Val) {
-if ((isLong && hi >= r.tp2Val) || (!isLong && lo <= r.tp2Val)) {
-r.timeTP2 = now; changed = true;
-}
-}
-if (!r.timeTP3 && r.tp3Val) {
-if ((isLong && hi >= r.tp3Val) || (!isLong && lo <= r.tp3Val)) {
-r.timeTP3 = now; changed = true;
-}
-}
-}
-}
-if (changed) {
-saveRecords();
-renderRecordPool();
-}
-return changed;
+  for (const r of recordPool) {
+    if (r.symbolId !== symbolId) continue;
+    if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
+    const isLong = r.side === 'LONG';
+    
+    const hitSL = !r.timeSL && (isLong ? lo <= r.stopVal : hi >= r.stopVal);
+    if (hitSL) {
+      r.timeSL = now; changed = true;
+    }
+    // 同一根 K 线内止损与止盈同时触碰：顺序无法判定，按止损先到（保守口径），本轮不盖止盈章
+    if (!hitSL) {
+      if (!r.timeTP1 && r.tp1Val) {
+        if ((isLong && hi >= r.tp1Val) || (!isLong && lo <= r.tp1Val)) {
+          r.timeTP1 = now; changed = true;
+        }
+      }
+      if (!r.timeTP2 && r.tp2Val) {
+        if ((isLong && hi >= r.tp2Val) || (!isLong && lo <= r.tp2Val)) {
+          r.timeTP2 = now; changed = true;
+        }
+      }
+      if (!r.timeTP3 && r.tp3Val) {
+        if ((isLong && hi >= r.tp3Val) || (!isLong && lo <= r.tp3Val)) {
+          r.timeTP3 = now; changed = true;
+        }
+      }
+    }
+  }
+  if (changed) {
+    saveRecords();
+    renderRecordPool();
+  }
+  return changed;
 }
 
 // ===== 失效盖章判定（收盘口径：短线看 15M 收盘，波段看 1H 收盘） =====
 function checkInvalidation(symbolId, close15, close1h) {
-let changed = false;
-const now = new Date().toLocaleTimeString("zh-CN", { hour12: false});
-for (const r of recordPool) {
-if (r.symbolId!== symbolId) continue;
-if (r.timeInv) continue;
-if (r.invVal === undefined || r.invVal === null ||!Number.isFinite(r.invVal)) continue;
-if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
-const close = r.invTf === "1h"? close1h: close15;
-if (close === null || close === undefined ||!Number.isFinite(close) || close <= 0) continue;
-const crossed = r.side === 'LONG'? close < r.invVal: close > r.invVal;
-if (crossed) {
-r.timeInv = now; changed = true;
-}
-}
-if (changed) {
-saveRecords();
-renderRecordPool();
-}
-return changed;
+  let changed = false;
+  const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  for (const r of recordPool) {
+    if (r.symbolId !== symbolId) continue;
+    if (r.timeInv) continue;
+    if (r.invVal === undefined || r.invVal === null || !Number.isFinite(r.invVal)) continue;
+    if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
+    const close = r.invTf === "1h" ? close1h : close15;
+    if (close === null || close === undefined || !Number.isFinite(close) || close <= 0) continue;
+    const crossed = r.side === 'LONG' ? close < r.invVal : close > r.invVal;
+    if (crossed) {
+      r.timeInv = now; changed = true;
+    }
+  }
+  if (changed) {
+    saveRecords();
+    renderRecordPool();
+  }
+  return changed;
 }
 
 // ===== 存入新策略 =====
 function isDuplicateRecord(symbolId, side, newStop, newEntryMid, track) {
-const now = Date.now();
-return recordPool.some(r =>
-r.symbolId === symbolId && r.side === side &&
-(r.track || "SHORT") === (track || "SHORT") &&
-(!r.ts || now - r.ts < ttlFor(r)) &&
-Math.abs(newStop - r.stopVal) / r.stopVal < SAME_POS_THRESHOLD &&
-Math.abs(newEntryMid - r.entryMidVal) / r.entryMidVal < SAME_POS_THRESHOLD
-);
+  const now = Date.now();
+  return recordPool.some(r =>
+    r.symbolId === symbolId && r.side === side &&
+    (r.track || "SHORT") === (track || "SHORT") &&
+    (!r.ts || now - r.ts < ttlFor(r)) &&
+    Math.abs(newStop - r.stopVal) / r.stopVal < SAME_POS_THRESHOLD &&
+    Math.abs(newEntryMid - r.entryMidVal) / r.entryMidVal < SAME_POS_THRESHOLD
+  );
 }
 
 function addRecordIfNeed(d) {
-if (d.side!== "LONG" && d.side!== "SHORT") return false;
-if (!d.stop ||!d.entry) return false;
+  if (d.side !== "LONG" && d.side !== "SHORT") return false;
+  if (!d.stop || !d.entry) return false;
+  
+  const entryMid = (d.entry[0] + d.entry[1]) / 2;
+  if (isDuplicateRecord(d.symbolId, d.side, d.stop, entryMid, d.track)) return false;
 
-const entryMid = (d.entry[0] + d.entry[1]) / 2;
-if (isDuplicateRecord(d.symbolId, d.side, d.stop, entryMid, d.track)) return false;
-
-const now = new Date();
-const rec = {
-id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
-ts: Date.now(),
-symbolId: d.symbolId,
-name: d.name,
-side: d.side,
-type: d.type,
-timeStr: now.toLocaleString("zh-CN", { hour12: false}),
-entryMidVal: entryMid,
-stopVal: d.stop,
-tp1Val: d.tp1,
-tp2Val: d.tp2,
-tp3Val: d.tp3,
-entryText: `${formatPrice(d.entry[0])} ~ ${formatPrice(d.entry[1])}`,
-stopText: formatPrice(d.stop),
-tp1Text: formatPrice(d.tp1),
-tp2Text: formatPrice(d.tp2),
-tp3Text: formatPrice(d.tp3),
-score: d.score,
-reasons: d.reasons,
-rr: d.rr,
-riskPct: d.riskPct,
-warnMsg: d.warnMsg,
-grade: d.grade,
-netDist: d.netDist,
-invalidText: d.invalidText,
-track: d.track || "SHORT",
-invVal: d.invVal!== undefined? d.invVal: null,
-invTf: d.invTf || "15m",
-timeSL: null, timeTP1: null, timeTP2: null, timeTP3: null, timeInv: null
-};
-
-recordPool.push(rec);
-saveRecords();
-renderRecordPool();
-return true;
+  const now = new Date();
+  const rec = {
+    id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
+    ts: Date.now(),
+    symbolId: d.symbolId,
+    name: d.name,
+    side: d.side,
+    type: d.type,
+    timeStr: now.toLocaleString("zh-CN", { hour12: false }),
+    entryMidVal: entryMid,
+    stopVal: d.stop,
+    tp1Val: d.tp1,
+    tp2Val: d.tp2,
+    tp3Val: d.tp3,
+    entryText: `${formatPrice(d.entry[0])} ~ ${formatPrice(d.entry[1])}`,
+    stopText: formatPrice(d.stop),
+    tp1Text: formatPrice(d.tp1),
+    tp2Text: formatPrice(d.tp2),
+    tp3Text: formatPrice(d.tp3),
+    score: d.score,
+    reasons: d.reasons,
+    rr: d.rr,
+    riskPct: d.riskPct,
+    warnMsg: d.warnMsg,
+    grade: d.grade,
+    netDist: d.netDist,
+    invalidText: d.invalidText,
+    track: d.track || "SHORT",
+    invVal: d.invVal !== undefined ? d.invVal : null,
+    invTf: d.invTf || "15m",
+    timeSL: null, timeTP1: null, timeTP2: null, timeTP3: null, timeInv: null
+  };
+  
+  recordPool.push(rec);
+  saveRecords();
+  renderRecordPool();
+  return true;
 }
 
 // ===== 指标计算 =====
 function ema(data, period) {
-if (data.length < period) return null;
-const k = 2 / (period + 1);
-let value = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
-for (let i = period; i < data.length; i++) value = data[i] * k + value * (1 - k);
-return value;
+  if (data.length < period) return null;
+  const k = 2 / (period + 1);
+  let value = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < data.length; i++) value = data[i] * k + value * (1 - k);
+  return value;
 }
 function sma(data, period) {
-if (data.length < period) return null;
-return data.slice(-period).reduce((a, b) => a + b, 0) / period;
+  if (data.length < period) return null;
+  return data.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 function rsi(data, period = 14) {
-if (data.length < period + 1) return null;
-let gains = 0, losses = 0;
-for (let i = data.length - period; i < data.length; i++) {
-const d = data[i] - data[i - 1];
-if (d > 0) gains += d; else losses -= d;
-}
-const avgGain = gains / period, avgLoss = losses / period;
-if (avgLoss === 0) return 100;
-return 100 - (100 / (1 + avgGain / avgLoss));
+  if (data.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = data.length - period; i < data.length; i++) {
+    const d = data[i] - data[i - 1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  const avgGain = gains / period, avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 function atr(k, period = 14) {
-if (k.closes.length < period + 1) return null;
-const values = [];
-for (let i = 1; i < k.closes.length; i++) {
-values.push(Math.max(k.highs[i] - k.lows[i], Math.abs(k.highs[i] - k.closes[i - 1]), Math.abs(k.lows[i] - k.closes[i - 1])));
-}
-return sma(values, period);
+  if (k.closes.length < period + 1) return null;
+  const values = [];
+  for (let i = 1; i < k.closes.length; i++) {
+    values.push(Math.max(k.highs[i] - k.lows[i], Math.abs(k.highs[i] - k.closes[i - 1]), Math.abs(k.lows[i] - k.closes[i - 1])));
+  }
+  return sma(values, period);
 }
 function findPivotLows(values, left = 3, right = 2) {
-const result = [];
-for (let i = left; i < values.length - right; i++) {
-let ok = true;
-for (let j = 1; j <= left; j++) if (values[i] >= values[i - j]) ok = false;
-for (let j = 1; j <= right; j++) if (values[i] >= values[i + j]) ok = false;
-if (ok) result.push({ index: i, value: values[i]});
-}
-return result;
+  const result = [];
+  for (let i = left; i < values.length - right; i++) {
+    let ok = true;
+    for (let j = 1; j <= left; j++) if (values[i] >= values[i - j]) ok = false;
+    for (let j = 1; j <= right; j++) if (values[i] >= values[i + j]) ok = false;
+    if (ok) result.push({ index: i, value: values[i] });
+  }
+  return result;
 }
 function findPivotHighs(values, left = 3, right = 2) {
-const result = [];
-for (let i = left; i < values.length - right; i++) {
-let ok = true;
-for (let j = 1; j <= left; j++) if (values[i] <= values[i - j]) ok = false;
-for (let j = 1; j <= right; j++) if (values[i] <= values[i + j]) ok = false;
-if (ok) result.push({ index: i, value: values[i]});
-}
-return result;
+  const result = [];
+  for (let i = left; i < values.length - right; i++) {
+    let ok = true;
+    for (let j = 1; j <= left; j++) if (values[i] <= values[i - j]) ok = false;
+    for (let j = 1; j <= right; j++) if (values[i] <= values[i + j]) ok = false;
+    if (ok) result.push({ index: i, value: values[i] });
+  }
+  return result;
 }
 
 // ===== 数据获取 =====
 function normalizeTicker(raw, receivedAt = Date.now()) {
-if (!raw) return null;
-const lastPrice = Number(raw.lastPrice?? raw.c?? raw.last?? raw.price);
-const markPrice = Number(raw.markPrice?? raw.m);
-const indexPrice = Number(raw.indexPrice?? raw.i);
-const changePct = Number(raw.priceChangePercent?? raw.P);
-const eventTime = Number(raw.eventTime?? raw.E?? raw.closeTime?? raw.timestamp?? raw.receivedAt);
-if (!Number.isFinite(lastPrice) || lastPrice <= 0) return null;
-return {
-lastPrice,
-markPrice: Number.isFinite(markPrice) && markPrice > 0? markPrice: null,
-indexPrice: Number.isFinite(indexPrice) && indexPrice > 0? indexPrice: null,
-changePct: Number.isFinite(changePct)? changePct: null,
-eventTime: Number.isFinite(eventTime) && eventTime > 0? eventTime: receivedAt,
-receivedAt
-};
+  if (!raw) return null;
+  const lastPrice = Number(raw.lastPrice ?? raw.c ?? raw.last ?? raw.price);
+  const markPrice = Number(raw.markPrice ?? raw.m);
+  const indexPrice = Number(raw.indexPrice ?? raw.i);
+  const changePct = Number(raw.priceChangePercent ?? raw.P);
+  const eventTime = Number(raw.eventTime ?? raw.E ?? raw.closeTime ?? raw.timestamp ?? raw.receivedAt);
+  if (!Number.isFinite(lastPrice) || lastPrice <= 0) return null;
+  return {
+    lastPrice,
+    markPrice: Number.isFinite(markPrice) && markPrice > 0 ? markPrice : null,
+    indexPrice: Number.isFinite(indexPrice) && indexPrice > 0 ? indexPrice : null,
+    changePct: Number.isFinite(changePct) ? changePct : null,
+    eventTime: Number.isFinite(eventTime) && eventTime > 0 ? eventTime : receivedAt,
+    receivedAt
+  };
 }
 
 async function refreshTickerSnapshot() {
-const response = await fetch(API + "/market/ticker/24hr", { method: "GET", headers: { "Accept": "application/json"}, cache: "no-store", signal: AbortSignal.timeout(10000)});
-if (!response.ok) throw new Error("WEEX行情HTTP " + response.status);
-const raw = await response.json();
-const rows = Array.isArray(raw)? raw: (Array.isArray(raw.data)? raw.data: [raw]);
-const receivedAt = Date.now(); let count = 0;
-for (const row of rows) {
-const symbol = String(row.symbol || "").toUpperCase();
-if (!SYMBOLS.some(x => x.id === symbol)) continue;
-const q = normalizeTicker(row, receivedAt);
-if (q) { tickerCache[symbol] = q; count++;}
-}
-if (count === 0) throw new Error("未读取到对应币种ticker");
-return count;
+  const response = await fetch(API + "/market/ticker/24hr", { method: "GET", headers: { "Accept": "application/json" }, cache: "no-store", signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw new Error("WEEX行情HTTP " + response.status);
+  const raw = await response.json();
+  const rows = Array.isArray(raw) ? raw : (Array.isArray(raw.data) ? raw.data : [raw]);
+  const receivedAt = Date.now(); let count = 0;
+  for (const row of rows) {
+    const symbol = String(row.symbol || "").toUpperCase();
+    if (!SYMBOLS.some(x => x.id === symbol)) continue;
+    const q = normalizeTicker(row, receivedAt);
+    if (q) { tickerCache[symbol] = q; count++; }
+  }
+  if (count === 0) throw new Error("未读取到对应币种ticker");
+  return count;
 }
 
 async function fetchKlines(symbol, interval) {
-const url = API + "/market/klines?symbol=" + encodeURIComponent(symbol) + "&interval=" + encodeURIComponent(interval) + "&limit=" + LIMIT;
-const controller = new AbortController();
-const timeout = setTimeout(() => controller.abort(), 10000);
-try {
-const response = await fetch(url, { method: "GET", headers: { "Accept": "application/json"}, signal: controller.signal, cache: "no-store"});
-if (!response.ok) throw new Error("K线接口 " + response.status);
-const raw = await response.json();
-if (!Array.isArray(raw) || raw.length < 30) throw new Error("K线数量不足");
-const now = Date.now();
-const closed = raw.filter(k => Array.isArray(k) && Number(k[6]) > 0 && Number(k[6]) < now);
-if (closed.length < 30) throw new Error("有效收盘K线太少");
-closed.sort((a, b) => Number(a[0]) - Number(b[0]));
-return parseKlines(closed);
-} finally { clearTimeout(timeout);}
+  const url = API + "/market/klines?symbol=" + encodeURIComponent(symbol) + "&interval=" + encodeURIComponent(interval) + "&limit=" + LIMIT;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, signal: controller.signal, cache: "no-store" });
+    if (!response.ok) throw new Error("K线接口 " + response.status);
+    const raw = await response.json();
+    if (!Array.isArray(raw) || raw.length < 30) throw new Error("K线数量不足");
+    const now = Date.now();
+    const closed = raw.filter(k => Array.isArray(k) && Number(k[6]) > 0 && Number(k[6]) < now);
+    if (closed.length < 30) throw new Error("有效收盘K线太少");
+    closed.sort((a, b) => Number(a[0]) - Number(b[0]));
+    return parseKlines(closed);
+  } finally { clearTimeout(timeout); }
 }
 
 function parseKlines(raw) {
-const result = { times: [], opens: [], highs: [], lows: [], closes: [], volumes: []};
-raw.forEach(k => {
-result.times.push(Number(k[0]));
-result.opens.push(Number(k[1]));
-result.highs.push(Number(k[2]));
-result.lows.push(Number(k[3]));
-result.closes.push(Number(k[4]));
-result.volumes.push(Number(k[5]));
-});
-return result;
+  const result = { times: [], opens: [], highs: [], lows: [], closes: [], volumes: [] };
+  raw.forEach(k => {
+    result.times.push(Number(k[0]));
+    result.opens.push(Number(k[1]));
+    result.highs.push(Number(k[2]));
+    result.lows.push(Number(k[3]));
+    result.closes.push(Number(k[4]));
+    result.volumes.push(Number(k[5]));
+  });
+  return result;
 }
 
 // ===== 逻辑分析 =====
 function getTrend(k) {
-const c = k.closes;
-const fast = ema(c, EMA_FAST), slow = ema(c, EMA_SLOW);
-const price = c[c.length - 1];
-if (fast === null) return "NEUTRAL";
-if (slow!== null) {
-if (price > fast && fast > slow) return "BULL";
-if (price < fast && fast < slow) return "BEAR";
-} else {
-if (price > fast) return "BULL";
-if (price < fast) return "BEAR";
-}
-return "NEUTRAL";
+  const c = k.closes;
+  const fast = ema(c, EMA_FAST), slow = ema(c, EMA_SLOW);
+  const price = c[c.length - 1];
+  if (fast === null) return "NEUTRAL";
+  if (slow !== null) {
+    if (price > fast && fast > slow) return "BULL";
+    if (price < fast && fast < slow) return "BEAR";
+  } else {
+    if (price > fast) return "BULL";
+    if (price < fast) return "BEAR";
+  }
+  return "NEUTRAL";
 }
 
 function getStructure(k) {
-const c = k.closes, h = k.highs, l = k.lows;
-const price = c[c.length - 1];
-const lookback = 20;
-const previousHigh = Math.max(...h.slice(-lookback - 1, -1));
-const previousLow = Math.min(...l.slice(-lookback - 1, -1));
-const breakUp = price > previousHigh;
-const breakDown = price < previousLow;
-const nearHigh = price >= previousHigh * 0.985;
-const nearLow = price <= previousLow * 1.015;
-const recentHighs = findPivotHighs(h);
-const recentLows = findPivotLows(l);
-const lastHigh = recentHighs.length? recentHighs[recentHighs.length - 1]: null;
-const lastLow = recentLows.length? recentLows[recentLows.length - 1]: null;
-const atrValue = atr(k) || price * 0.005;
-return { previousHigh, previousLow, breakUp, breakDown, nearHigh, nearLow, lastHigh, lastLow, atrValue};
+  const c = k.closes, h = k.highs, l = k.lows;
+  const price = c[c.length - 1];
+  const lookback = 20;
+  const previousHigh = Math.max(...h.slice(-lookback - 1, -1));
+  const previousLow = Math.min(...l.slice(-lookback - 1, -1));
+  const breakUp = price > previousHigh;
+  const breakDown = price < previousLow;
+  const nearHigh = price >= previousHigh * 0.985;
+  const nearLow = price <= previousLow * 1.015;
+  const recentHighs = findPivotHighs(h);
+  const recentLows = findPivotLows(l);
+  const lastHigh = recentHighs.length ? recentHighs[recentHighs.length - 1] : null;
+  const lastLow = recentLows.length ? recentLows[recentLows.length - 1] : null;
+  const atrValue = atr(k) || price * 0.005;
+  return { previousHigh, previousLow, breakUp, breakDown, nearHigh, nearLow, lastHigh, lastLow, atrValue };
 }
 
 function detectDivergence(k) {
-const prices = k.closes;
-const values = [];
-for (let i = 0; i < prices.length; i++) values.push(rsi(prices.slice(0, i + 1), 14));
-const valid = [];
-for (let i = 0; i < values.length; i++) if (values[i]!== null) valid.push({ index: i, value: values[i]});
-if (valid.length < 10) return { bull: false, bear: false};
-
-const rsiValues = values.map(v => v === null? 50: v);
-const lows = findPivotLows(k.lows), highs = findPivotHighs(k.highs);
-let bull = false, bear = false;
-
-if (lows.length >= 2) {
-const a = lows[lows.length - 2], b = lows[lows.length - 1];
-if (b.index - a.index >= 3) bull = k.lows[b.index] < k.lows[a.index] && rsiValues[b.index] > rsiValues[a.index] + 2;
-}
-if (highs.length >= 2) {
-const a = highs[highs.length - 2], b = highs[highs.length - 1];
-if (b.index - a.index >= 3) bear = k.highs[b.index] > k.highs[a.index] && rsiValues[b.index] < rsiValues[a.index] - 2;
-}
-return { bull, bear};
+  const prices = k.closes;
+  const values = [];
+  for (let i = 0; i < prices.length; i++) values.push(rsi(prices.slice(0, i + 1), 14));
+  const valid = [];
+  for (let i = 0; i < values.length; i++) if (values[i] !== null) valid.push({ index: i, value: values[i] });
+  if (valid.length < 10) return { bull: false, bear: false };
+  
+  const rsiValues = values.map(v => v === null ? 50 : v);
+  const lows = findPivotLows(k.lows), highs = findPivotHighs(k.highs);
+  let bull = false, bear = false;
+  
+  if (lows.length >= 2) {
+    const a = lows[lows.length - 2], b = lows[lows.length - 1];
+    if (b.index - a.index >= 3) bull = k.lows[b.index] < k.lows[a.index] && rsiValues[b.index] > rsiValues[a.index] + 2;
+  }
+  if (highs.length >= 2) {
+    const a = highs[highs.length - 2], b = highs[highs.length - 1];
+    if (b.index - a.index >= 3) bear = k.highs[b.index] > k.highs[a.index] && rsiValues[b.index] < rsiValues[a.index] - 2;
+  }
+  return { bull, bear };
 }
 
 // TP 结构位筛选：宽 pivot（约 2 小时级别摆动点）+ 极值位，
 // 先剔除离入场太近的噪音位，再合并挨得太近的相邻位（只留更远的那个），最后统一向内侧收。
 function buildTpLevels(k15, s15, side, entryMid) {
-const atr15 = s15.atrValue;
-const isLong = side === "LONG";
-const raw = [];
-const extreme = isLong? s15.previousHigh: s15.previousLow;
-if (Number.isFinite(extreme) && (isLong? extreme > entryMid: extreme < entryMid)) raw.push(extreme);
-const pivots = isLong? findPivotHighs(k15.highs, 8, 5): findPivotLows(k15.lows, 8, 5);
-for (const p of pivots) {
-if (isLong? p.value > entryMid: p.value < entryMid) raw.push(p.value);
-}
-let levels = [...new Set(raw)].sort((a, b) => isLong? a - b: b - a);
-levels = levels.filter(lv => Math.abs(lv - entryMid) >= TP_MIN_DIST_ATR * atr15);
-const merged = [];
-for (const lv of levels) {
-if (merged.length && Math.abs(lv - merged[merged.length - 1]) < TP_MERGE_ATR * atr15) {
-merged[merged.length - 1] = lv;
-} else {
-merged.push(lv);
-}
-}
-return merged.map(lv => isLong? lv - 0.1 * atr15: lv + 0.1 * atr15);
+  const atr15 = s15.atrValue;
+  const isLong = side === "LONG";
+  const raw = [];
+  const extreme = isLong ? s15.previousHigh : s15.previousLow;
+  if (Number.isFinite(extreme) && (isLong ? extreme > entryMid : extreme < entryMid)) raw.push(extreme);
+  const pivots = isLong ? findPivotHighs(k15.highs, 8, 5) : findPivotLows(k15.lows, 8, 5);
+  for (const p of pivots) {
+    if (isLong ? p.value > entryMid : p.value < entryMid) raw.push(p.value);
+  }
+  let levels = [...new Set(raw)].sort((a, b) => isLong ? a - b : b - a);
+  levels = levels.filter(lv => Math.abs(lv - entryMid) >= TP_MIN_DIST_ATR * atr15);
+  const merged = [];
+  for (const lv of levels) {
+    if (merged.length && Math.abs(lv - merged[merged.length - 1]) < TP_MERGE_ATR * atr15) {
+      merged[merged.length - 1] = lv;
+    } else {
+      merged.push(lv);
+    }
+  }
+  return merged.map(lv => isLong ? lv - 0.1 * atr15 : lv + 0.1 * atr15);
 }
 
 function analyze(info, k4h, k1h, k15, k5, ticker) {
-const analysisPrice = k5.closes[k5.closes.length - 1];
-const price = ticker.lastPrice;
-const changePct = ticker.changePct === null? 0: ticker.changePct;
-const trend4 = getTrend(k4h), trend1 = getTrend(k1h), trend15 = getTrend(k15);
-const structure15 = getStructure(k15), structure5 = getStructure(k5);
-const volAvg = sma(k5.volumes.slice(0, -1), 20);
-const volNow = k5.volumes[k5.volumes.length - 1];
-const volOk = volAvg!== null && volNow > volAvg * VOL_MULT;
-const rsiValue = rsi(k5.closes);
-const div = detectDivergence(k5);
-const ema50_5 = ema(k5.closes, EMA_FAST);
-const candleOpen = k5.opens[k5.opens.length - 1];
-const candleClose = analysisPrice;
-const candleHigh = k5.highs[k5.highs.length - 1];
-const candleLow = k5.lows[k5.lows.length - 1];
-const bullishCandle = candleClose > candleOpen;
-const bearishCandle = candleClose < candleOpen;
-const nearEma = ema50_5!== null && Math.abs(analysisPrice - ema50_5) / analysisPrice < 0.008;
-const longBreak = structure15.breakUp, shortBreak = structure15.breakDown;
-
-const longPullback =!longBreak && structure15.nearHigh && bullishCandle && (nearEma || structure5.lastLow && analysisPrice > structure5.lastLow.value);
-const shortPullback =!shortBreak && structure15.nearLow && bearishCandle && (nearEma || structure5.lastHigh && analysisPrice < structure5.lastHigh.value);
-const longConfirm = bullishCandle && (longBreak || longPullback) && analysisPrice > candleLow;
-const shortConfirm = bearishCandle && (shortBreak || shortPullback) && analysisPrice < candleHigh;
-
-let longScore = 0, shortScore = 0;
-const longReasons = [], shortReasons = [];
-
-if (trend4 === "BULL") { longScore += 0.5; longReasons.push("4H趋势偏多");}
-if (trend4 === "BEAR") { shortScore += 0.5; shortReasons.push("4H趋势偏空");}
-if (trend1 === "BULL") { longScore += 0.5; longReasons.push("1H方向偏多");}
-if (trend1 === "BEAR") { shortScore += 0.5; shortReasons.push("1H方向偏空");}
-if (trend15 === "BULL") { longScore += 0.5; longReasons.push("15M结构偏多");}
-if (trend15 === "BEAR") { shortScore += 0.5; shortReasons.push("15M结构偏空");}
-
-if (longBreak) { longScore += 1; longReasons.push("15M向上突破");}
-if (shortBreak) { shortScore += 1; shortReasons.push("15M向下突破");}
-if (longPullback) { longScore += 1; longReasons.push("突破/回踩承接");}
-if (shortPullback) { shortScore += 1; shortReasons.push("跌破/反抽承压");}
-
-if (volOk) {
-if (bullishCandle) { longScore += 0.5; longReasons.push("5M放量阳线");}
-if (bearishCandle) { shortScore += 0.5; shortReasons.push("5M放量阴线");}
-}
-if (nearEma) {
-if (bullishCandle) longScore += 0.5;
-if (bearishCandle) shortScore += 0.5;
-}
-if (div.bull) { longScore += 0.5; longReasons.push("RSI底背离");}
-if (div.bear) { shortScore += 0.5; shortReasons.push("RSI顶背离");}
-
-if (rsiValue!== null && rsiValue > 78) longScore -= 0.5;
-if (rsiValue!== null && rsiValue < 22) shortScore -= 0.5;
-
-if (trend4 === "BEAR") longScore -= 1;
-if (trend4 === "BULL") shortScore -= 1;
-
-longScore = Math.max(0, longScore);
-shortScore = Math.max(0, shortScore);
-
-let side = "NONE", type = "观望", score = 0, reasons = [];
-let confirmed = false, isReversal = false;
-
-const canDoReversal = REVERSAL_WHITELIST.includes(info.id);
-
-const extremeLongReversal = canDoReversal && (rsiValue!== null && rsiValue < 28) && bullishCandle && (div.bull || volOk);
-const extremeShortReversal = canDoReversal && (rsiValue!== null && rsiValue > 72) && bearishCandle && (div.bear || volOk);
-
-const longReady = longScore >= MIN_SCORE && longScore > shortScore;
-const shortReady = shortScore >= MIN_SCORE && shortScore > longScore;
-
-if (extremeLongReversal && trend4!== "BULL") {
-side = "LONG"; score = 2.5; type = "⚠️ 逆势抄底 · 短线多"; isReversal = true;
-reasons = ["5M极度超卖", "出现企稳反转迹象", "注意快进快出"];
-} else if (extremeShortReversal && trend4!== "BEAR") {
-side = "SHORT"; score = 2.5; type = "⚠️ 逆势摸顶 · 短线空"; isReversal = true;
-reasons = ["5M极度超买", "出现滞涨反转迹象", "注意快进快出"];
-} else if (longReady) {
-side = "LONG"; score = longScore; reasons = longReasons; confirmed = longConfirm;
-if (longConfirm) type = longBreak? "确认做多 · 突破": "确认做多 · 回踩";
-else if (longPullback) type = "回踩埋伏 · 做多";
-else type = "提前预警 · 偏多";
-} else if (shortReady) {
-side = "SHORT"; score = shortScore; reasons = shortReasons; confirmed = shortConfirm;
-if (shortConfirm) type = shortBreak? "确认做空 · 跌破": "确认做空 · 反抽";
-else if (shortPullback) type = "反抽埋伏 · 做空";
-else type = "提前预警 · 偏空";
-} else if (longScore > shortScore && longScore >= 1) {
-side = "WATCH"; score = longScore; type = "观察 · 等待做多确认"; reasons = longReasons;
-} else if (shortScore > longScore && shortScore >= 1) {
-side = "WATCH"; score = shortScore; type = "观察 · 等待做空确认"; reasons = shortReasons;
-}
-
-// ===== 交易计划（顺势/逆势共用一套结构算法） =====
-let entry = null, stop = null, tp1 = null, tp2 = null, tp3 = null, rr = null;
-let riskPct = 0, warnMsg = "", grade = null, netDist = null, invalidText = "";
-let invVal = null;
-
-if (side === "LONG" || side === "SHORT") {
-const isLong = side === "LONG";
-const atr5 = structure5.atrValue, atr15 = structure15.atrValue;
-entry = isLong
-? [price - atr5 * 0.25, price + atr5 * 0.1]
-: [price - atr5 * 0.1, price + atr5 * 0.25];
-const entryMid = (entry[0] + entry[1]) / 2;
-
-let inv;
-if (isLong) {
-const recent24Lows = Math.min(...k15.lows.slice(-24));
-const pivotLows = findPivotLows(k15.lows);
-const lastPivotLow = pivotLows.length? pivotLows[pivotLows.length - 1].value: Infinity;
-inv = Math.min(structure15.previousLow, lastPivotLow, recent24Lows);
-} else {
-const recent24Highs = Math.max(...k15.highs.slice(-24));
-const pivotHighs = findPivotHighs(k15.highs);
-const lastPivotHigh = pivotHighs.length? pivotHighs[pivotHighs.length - 1].value: -Infinity;
-inv = Math.max(structure15.previousHigh, lastPivotHigh, recent24Highs);
-}
-
-if (!Number.isFinite(inv) || (isLong? inv >= entryMid: inv <= entryMid)) {
-side = "WATCH"; type = "结构位缺失 · 观望";
-entry = null;
-} else {
-stop = isLong? inv - 0.5 * atr15: inv + 0.5 * atr15;
-const tps = buildTpLevels(k15, structure15, side, entryMid);
-tp1 = tps.length > 0? tps[0]: null;
-tp2 = tps.length > 1? tps[1]: null;
-tp3 = tps.length > 2? tps[2]: null;
-
-if (!tp1) {
-side = "WATCH"; type = "止盈结构缺失 · 观望";
-entry = stop = null;
-} else {
-rr = Math.abs(entryMid - tp1) / Math.abs(entryMid - stop);
-riskPct = Math.abs(stop - entryMid) / entryMid;
-const warnList = [];
-if (riskPct > WIDE_STOP_PCT) warnList.push(`止损过宽 ${(riskPct*100).toFixed(1)}%`);
-if (rr < MIN_RR) warnList.push(`盈亏比不足 ${rr.toFixed(2)}`);
-if (!confirmed &&!isReversal) warnList.push("未确认（无5M确认）");
-if (warnList.length > 0) warnMsg = "⚠️ " + warnList.join(" & ");
-
-const tp1Pct = Math.abs(entryMid - tp1) / entryMid;
-grade = tp1Pct < GRADE_ULTRA? "超短线": tp1Pct <= GRADE_SHORT? "短线": "波段";
-if (grade === "超短线") netDist = Math.abs(entryMid - tp1) - entryMid * FEE_RT;
-
-invalidText = isLong
-? `15M 收盘跌破 ${formatPrice(inv)}`
-: `15M 收盘站上 ${formatPrice(inv)}`;
-invVal = inv;
-}
-}
-}
-
-return {
-name: info.name, symbolId: info.id, group: info.group, price, changePct, ticker, side, type, score,
-reasons: reasons.join(" · ") || "暂无明确信号",
-trend4, trend1, trend15, volOk, rsiValue, div,
-entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade, netDist, invalidText,
-invVal, invTf: "15m",
-lastClose15: k15.closes[k15.closes.length - 1],
-lastClose1h: k1h.closes[k1h.closes.length - 1],
-swing: analyzeSwing(info, k4h, k1h, k15, price),
-longScore, shortScore, lastBarHigh: candleHigh, lastBarLow: candleLow
-};
+  const analysisPrice = k5.closes[k5.closes.length - 1];
+  const price = ticker.lastPrice;
+  const changePct = ticker.changePct === null ? 0 : ticker.changePct;
+  const trend4 = getTrend(k4h), trend1 = getTrend(k1h), trend15 = getTrend(k15);
+  const structure15 = getStructure(k15), structure5 = getStructure(k5);
+  const volAvg = sma(k5.volumes.slice(0, -1), 20);
+  const volNow = k5.volumes[k5.volumes.length - 1];
+  const volOk = volAvg !== null && volNow > volAvg * VOL_MULT;
+  const rsiValue = rsi(k5.closes);
+  const div = detectDivergence(k5);
+  const ema50_5 = ema(k5.closes, EMA_FAST);
+  const candleOpen = k5.opens[k5.opens.length - 1];
+  const candleClose = analysisPrice;
+  const candleHigh = k5.highs[k5.highs.length - 1];
+  const candleLow = k5.lows[k5.lows.length - 1];
+  const bullishCandle = candleClose > candleOpen;
+  const bearishCandle = candleClose < candleOpen;
+  const nearEma = ema50_5 !== null && Math.abs(analysisPrice - ema50_5) / analysisPrice < 0.008;
+  const longBreak = structure15.breakUp, shortBreak = structure15.breakDown;
+  
+  const longPullback = !longBreak && structure15.nearHigh && bullishCandle && (nearEma || structure5.lastLow && analysisPrice > structure5.lastLow.value);
+  const shortPullback = !shortBreak && structure15.nearLow && bearishCandle && (nearEma || structure5.lastHigh && analysisPrice < structure5.lastHigh.value);
+  const longConfirm = bullishCandle && (longBreak || longPullback) && analysisPrice > candleLow;
+  const shortConfirm = bearishCandle && (shortBreak || shortPullback) && analysisPrice < candleHigh;
+  
+  let longScore = 0, shortScore = 0;
+  const longReasons = [], shortReasons = [];
+  
+  if (trend4 === "BULL") { longScore += 0.5; longReasons.push("4H趋势偏多"); }
+  if (trend4 === "BEAR") { shortScore += 0.5; shortReasons.push("4H趋势偏空"); }
+  if (trend1 === "BULL") { longScore += 0.5; longReasons.push("1H方向偏多"); }
+  if (trend1 === "BEAR") { shortScore += 0.5; shortReasons.push("1H方向偏空"); }
+  if (trend15 === "BULL") { longScore += 0.5; longReasons.push("15M结构偏多"); }
+  if (trend15 === "BEAR") { shortScore += 0.5; shortReasons.push("15M结构偏空"); }
+  
+  if (longBreak) { longScore += 1; longReasons.push("15M向上突破"); }
+  if (shortBreak) { shortScore += 1; shortReasons.push("15M向下突破"); }
+  if (longPullback) { longScore += 1; longReasons.push("突破/回踩承接"); }
+  if (shortPullback) { shortScore += 1; shortReasons.push("跌破/反抽承压"); }
+  
+  if (volOk) {
+    if (bullishCandle) { longScore += 0.5; longReasons.push("5M放量阳线"); }
+    if (bearishCandle) { shortScore += 0.5; shortReasons.push("5M放量阴线"); }
+  }
+  if (nearEma) {
+    if (bullishCandle) longScore += 0.5;
+    if (bearishCandle) shortScore += 0.5;
+  }
+  if (div.bull) { longScore += 0.5; longReasons.push("RSI底背离"); }
+  if (div.bear) { shortScore += 0.5; shortReasons.push("RSI顶背离"); }
+  
+  if (rsiValue !== null && rsiValue > 78) longScore -= 0.5;
+  if (rsiValue !== null && rsiValue < 22) shortScore -= 0.5;
+  
+  if (trend4 === "BEAR") longScore -= 1;
+  if (trend4 === "BULL") shortScore -= 1;
+  
+  longScore = Math.max(0, longScore);
+  shortScore = Math.max(0, shortScore);
+  
+  let side = "NONE", type = "观望", score = 0, reasons = [];
+  let confirmed = false, isReversal = false;
+  
+  const canDoReversal = REVERSAL_WHITELIST.includes(info.id);
+  
+  const extremeLongReversal = canDoReversal && (rsiValue !== null && rsiValue < 28) && bullishCandle && (div.bull || volOk);
+  const extremeShortReversal = canDoReversal && (rsiValue !== null && rsiValue > 72) && bearishCandle && (div.bear || volOk);
+  
+  const longReady = longScore >= MIN_SCORE && longScore > shortScore;
+  const shortReady = shortScore >= MIN_SCORE && shortScore > longScore;
+  
+  if (extremeLongReversal && trend4 !== "BULL") {
+    side = "LONG"; score = 2.5; type = "⚠️ 逆势抄底 · 短线多"; isReversal = true;
+    reasons = ["5M极度超卖", "出现企稳反转迹象", "注意快进快出"];
+  } else if (extremeShortReversal && trend4 !== "BEAR") {
+    side = "SHORT"; score = 2.5; type = "⚠️ 逆势摸顶 · 短线空"; isReversal = true;
+    reasons = ["5M极度超买", "出现滞涨反转迹象", "注意快进快出"];
+  } else if (longReady) {
+    side = "LONG"; score = longScore; reasons = longReasons; confirmed = longConfirm;
+    if (longConfirm) type = longBreak ? "确认做多 · 突破" : "确认做多 · 回踩";
+    else if (longPullback) type = "回踩埋伏 · 做多";
+    else type = "提前预警 · 偏多";
+  } else if (shortReady) {
+    side = "SHORT"; score = shortScore; reasons = shortReasons; confirmed = shortConfirm;
+    if (shortConfirm) type = shortBreak ? "确认做空 · 跌破" : "确认做空 · 反抽";
+    else if (shortPullback) type = "反抽埋伏 · 做空";
+    else type = "提前预警 · 偏空";
+  } else if (longScore > shortScore && longScore >= 1) {
+    side = "WATCH"; score = longScore; type = "观察 · 等待做多确认"; reasons = longReasons;
+  } else if (shortScore > longScore && shortScore >= 1) {
+    side = "WATCH"; score = shortScore; type = "观察 · 等待做空确认"; reasons = shortReasons;
+  }
+  
+  // ===== 交易计划（顺势/逆势共用一套结构算法） =====
+  let entry = null, stop = null, tp1 = null, tp2 = null, tp3 = null, rr = null;
+  let riskPct = 0, warnMsg = "", grade = null, netDist = null, invalidText = "";
+  let invVal = null;
+  
+  if (side === "LONG" || side === "SHORT") {
+    const isLong = side === "LONG";
+    const atr5 = structure5.atrValue, atr15 = structure15.atrValue;
+    entry = isLong
+      ? [price - atr5 * 0.25, price + atr5 * 0.1]
+      : [price - atr5 * 0.1, price + atr5 * 0.25];
+    const entryMid = (entry[0] + entry[1]) / 2;
+    
+    let inv;
+    if (isLong) {
+      const recent24Lows = Math.min(...k15.lows.slice(-24));
+      const pivotLows = findPivotLows(k15.lows);
+      const lastPivotLow = pivotLows.length ? pivotLows[pivotLows.length - 1].value : Infinity;
+      inv = Math.min(structure15.previousLow, lastPivotLow, recent24Lows);
+    } else {
+      const recent24Highs = Math.max(...k15.highs.slice(-24));
+      const pivotHighs = findPivotHighs(k15.highs);
+      const lastPivotHigh = pivotHighs.length ? pivotHighs[pivotHighs.length - 1].value : -Infinity;
+      inv = Math.max(structure15.previousHigh, lastPivotHigh, recent24Highs);
+    }
+    
+    if (!Number.isFinite(inv) || (isLong ? inv >= entryMid : inv <= entryMid)) {
+      side = "WATCH"; type = "结构位缺失 · 观望";
+      entry = null;
+    } else {
+      stop = isLong ? inv - 0.5 * atr15 : inv + 0.5 * atr15;
+      const tps = buildTpLevels(k15, structure15, side, entryMid);
+      tp1 = tps.length > 0 ? tps[0] : null;
+      tp2 = tps.length > 1 ? tps[1] : null;
+      tp3 = tps.length > 2 ? tps[2] : null;
+      
+      if (!tp1) {
+        side = "WATCH"; type = "止盈结构缺失 · 观望";
+        entry = stop = null;
+      } else {
+        rr = Math.abs(entryMid - tp1) / Math.abs(entryMid - stop);
+        riskPct = Math.abs(stop - entryMid) / entryMid;
+        const warnList = [];
+        if (riskPct > WIDE_STOP_PCT) warnList.push(`止损过宽 ${(riskPct*100).toFixed(1)}%`);
+        if (rr < MIN_RR) warnList.push(`盈亏比不足 ${rr.toFixed(2)}`);
+        if (!confirmed && !isReversal) warnList.push("未确认（无5M确认）");
+        if (warnList.length > 0) warnMsg = "⚠️ " + warnList.join(" & ");
+        
+        const tp1Pct = Math.abs(entryMid - tp1) / entryMid;
+        grade = tp1Pct < GRADE_ULTRA ? "超短线" : tp1Pct <= GRADE_SHORT ? "短线" : "波段";
+        if (grade === "超短线") netDist = Math.abs(entryMid - tp1) - entryMid * FEE_RT;
+        
+        invalidText = isLong
+          ? `15M 收盘跌破 ${formatPrice(inv)}`
+          : `15M 收盘站上 ${formatPrice(inv)}`;
+        invVal = inv;
+      }
+    }
+  }
+  
+  return {
+    name: info.name, symbolId: info.id, group: info.group, price, changePct, ticker, side, type, score,
+    reasons: reasons.join(" · ") || "暂无明确信号",
+    trend4, trend1, trend15, volOk, rsiValue, div,
+    entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade, netDist, invalidText,
+    invVal, invTf: "15m",
+    lastClose15: k15.closes[k15.closes.length - 1],
+    lastClose1h: k1h.closes[k1h.closes.length - 1],
+    swing: analyzeSwing(info, k4h, k1h, k15, price),
+    longScore, shortScore, lastBarHigh: candleHigh, lastBarLow: candleLow
+  };
 }
 
 // ===== 波段线（独立第二轨：4H 背景 / 1H 结构 / 15M 确认） =====
 // TP 候选来自外部给定的大结构位列表，筛选口径与短线一致（剔近、合并、内收），距离单位用 ATR(1H)
 function buildSwingTpLevels(rawLevels, side, entryMid, atrUnit) {
-const isLong = side === "LONG";
-let levels = [...new Set(rawLevels.filter(v => Number.isFinite(v) && (isLong? v > entryMid: v < entryMid)))];
-levels.sort((a, b) => isLong? a - b: b - a);
-levels = levels.filter(lv => Math.abs(lv - entryMid) >= TP_MIN_DIST_ATR * atrUnit);
-const merged = [];
-for (const lv of levels) {
-if (merged.length && Math.abs(lv - merged[merged.length - 1]) < TP_MERGE_ATR * atrUnit) {
-merged[merged.length - 1] = lv;
-} else {
-merged.push(lv);
-}
-}
-return merged.map(lv => isLong? lv - 0.1 * atrUnit: lv + 0.1 * atrUnit);
+  const isLong = side === "LONG";
+  let levels = [...new Set(rawLevels.filter(v => Number.isFinite(v) && (isLong ? v > entryMid : v < entryMid)))];
+  levels.sort((a, b) => isLong ? a - b : b - a);
+  levels = levels.filter(lv => Math.abs(lv - entryMid) >= TP_MIN_DIST_ATR * atrUnit);
+  const merged = [];
+  for (const lv of levels) {
+    if (merged.length && Math.abs(lv - merged[merged.length - 1]) < TP_MERGE_ATR * atrUnit) {
+      merged[merged.length - 1] = lv;
+    } else {
+      merged.push(lv);
+    }
+  }
+  return merged.map(lv => isLong ? lv - 0.1 * atrUnit : lv + 0.1 * atrUnit);
 }
 
 function analyzeSwing(info, k4h, k1h, k15, price) {
-if (!price || price <= 0) return null;
-if (k1h.closes.length < 60 || k15.closes.length < 5) return null;
-const trend4 = getTrend(k4h);
-const s1 = getStructure(k1h);
-const atr1 = s1.atrValue;
-const atr15 = getStructure(k15).atrValue;
-if (!Number.isFinite(atr1) || atr1 <= 0) return null;
+  if (!price || price <= 0) return null;
+  if (k1h.closes.length < 60 || k15.closes.length < 5) return null;
+  const trend4 = getTrend(k4h);
+  const s1 = getStructure(k1h);
+  const atr1 = s1.atrValue;
+  const atr15 = getStructure(k15).atrValue;
+  if (!Number.isFinite(atr1) || atr1 <= 0) return null;
 
-const h60 = Math.max(...k1h.highs.slice(-60));
-const l60 = Math.min(...k1h.lows.slice(-60));
+  const h60 = Math.max(...k1h.highs.slice(-60));
+  const l60 = Math.min(...k1h.lows.slice(-60));
 
-// 15M 确认：最后一根已收盘 15M K 线 —— 做多看下影拒绝（≥50%）或阳吞没；做空镜像
-const n = k15.closes.length;
-const o = k15.opens[n - 1], h = k15.highs[n - 1], l = k15.lows[n - 1], c = k15.closes[n - 1];
-const po = k15.opens[n - 2], pc = k15.closes[n - 2];
-const rng = h - l;
-const bullConfirm = rng > 0 && c > o && ((Math.min(o, c) - l) / rng >= 0.5 || (pc < po && c >= po && o <= pc));
-const bearConfirm = rng > 0 && c < o && ((h - Math.max(o, c)) / rng >= 0.5 || (pc > po && c <= po && o >= pc));
+  // 15M 确认：最后一根已收盘 15M K 线 —— 做多看下影拒绝（≥50%）或阳吞没；做空镜像
+  const n = k15.closes.length;
+  const o = k15.opens[n - 1], h = k15.highs[n - 1], l = k15.lows[n - 1], c = k15.closes[n - 1];
+  const po = k15.opens[n - 2], pc = k15.closes[n - 2];
+  const rng = h - l;
+  const bullConfirm = rng > 0 && c > o && ((Math.min(o, c) - l) / rng >= 0.5 || (pc < po && c >= po && o <= pc));
+  const bearConfirm = rng > 0 && c < o && ((h - Math.max(o, c)) / rng >= 0.5 || (pc > po && c <= po && o >= pc));
 
-// 1H 支撑/阻力候选：60 根区间极值 + 20 根前高前低 + 最近摆动点 + 宽摆动点
-const supSet = [l60, s1.previousLow];
-const resSet = [h60, s1.previousHigh];
-if (s1.lastLow) supSet.push(s1.lastLow.value);
-if (s1.lastHigh) resSet.push(s1.lastHigh.value);
-for (const p of findPivotLows(k1h.lows, 5, 3)) supSet.push(p.value);
-for (const p of findPivotHighs(k1h.highs, 5, 3)) resSet.push(p.value);
-const supports = supSet.filter(v => Number.isFinite(v) && v < price);
-const resistances = resSet.filter(v => Number.isFinite(v) && v > price);
-const support = supports.length? Math.max(...supports): null; // 离现价最近的下方支撑
-const resistance = resistances.length? Math.min(...resistances): null; // 离现价最近的上方阻力
+  // 1H 支撑/阻力候选：60 根区间极值 + 20 根前高前低 + 最近摆动点 + 宽摆动点
+  const supSet = [l60, s1.previousLow];
+  const resSet = [h60, s1.previousHigh];
+  if (s1.lastLow) supSet.push(s1.lastLow.value);
+  if (s1.lastHigh) resSet.push(s1.lastHigh.value);
+  for (const p of findPivotLows(k1h.lows, 5, 3)) supSet.push(p.value);
+  for (const p of findPivotHighs(k1h.highs, 5, 3)) resSet.push(p.value);
+  const supports = supSet.filter(v => Number.isFinite(v) && v < price);
+  const resistances = resSet.filter(v => Number.isFinite(v) && v > price);
+  const support = supports.length ? Math.max(...supports) : null;    // 离现价最近的下方支撑
+  const resistance = resistances.length ? Math.min(...resistances) : null; // 离现价最近的上方阻力
 
-const NEAR = 0.35 * atr1;
-let side = null, level = null, modeText = "";
-const longSetup = support!== null && price - support <= NEAR && bullConfirm &&
-(trend4 === "BULL" || (trend4 === "NEUTRAL" && support <= l60 + 0.1 * atr1));
-const shortSetup = resistance!== null && resistance - price <= NEAR && bearConfirm &&
-(trend4 === "BEAR" || (trend4 === "NEUTRAL" && resistance >= h60 - 0.1 * atr1));
-if (longSetup &&!shortSetup) {
-side = "LONG"; level = support;
-modeText = trend4 === "BULL"? "趋势回踩": "区间下沿";
-} else if (shortSetup &&!longSetup) {
-side = "SHORT"; level = resistance;
-modeText = trend4 === "BEAR"? "趋势反抽": "区间上沿";
-} else {
-return null;
-}
+  const NEAR = 0.35 * atr1;
+  let side = null, level = null, modeText = "";
+  const longSetup = support !== null && price - support <= NEAR && bullConfirm &&
+    (trend4 === "BULL" || (trend4 === "NEUTRAL" && support <= l60 + 0.1 * atr1));
+  const shortSetup = resistance !== null && resistance - price <= NEAR && bearConfirm &&
+    (trend4 === "BEAR" || (trend4 === "NEUTRAL" && resistance >= h60 - 0.1 * atr1));
+  if (longSetup && !shortSetup) {
+    side = "LONG"; level = support;
+    modeText = trend4 === "BULL" ? "趋势回踩" : "区间下沿";
+  } else if (shortSetup && !longSetup) {
+    side = "SHORT"; level = resistance;
+    modeText = trend4 === "BEAR" ? "趋势反抽" : "区间上沿";
+  } else {
+    return null;
+  }
 
-const isLong = side === "LONG";
-const entry = isLong
-? [price - atr15 * 0.25, price + atr15 * 0.1]
-: [price - atr15 * 0.1, price + atr15 * 0.25];
-const entryMid = (entry[0] + entry[1]) / 2;
-const stop = isLong? level - 0.5 * atr1: level + 0.5 * atr1;
+  const isLong = side === "LONG";
+  const entry = isLong
+    ? [price - atr15 * 0.25, price + atr15 * 0.1]
+    : [price - atr15 * 0.1, price + atr15 * 0.25];
+  const entryMid = (entry[0] + entry[1]) / 2;
+  const stop = isLong ? level - 0.5 * atr1 : level + 0.5 * atr1;
 
-const rawTp = isLong? [...resSet]: [...supSet];
-for (const p of (isLong? findPivotHighs(k4h.highs): findPivotLows(k4h.lows))) rawTp.push(p.value);
-const tps = buildSwingTpLevels(rawTp, side, entryMid, atr1);
-const tp1 = tps.length > 0? tps[0]: null;
-const tp2 = tps.length > 1? tps[1]: null;
-const tp3 = tps.length > 2? tps[2]: null;
-if (!tp1) return null;
+  const rawTp = isLong ? [...resSet] : [...supSet];
+  for (const p of (isLong ? findPivotHighs(k4h.highs) : findPivotLows(k4h.lows))) rawTp.push(p.value);
+  const tps = buildSwingTpLevels(rawTp, side, entryMid, atr1);
+  const tp1 = tps.length > 0 ? tps[0] : null;
+  const tp2 = tps.length > 1 ? tps[1] : null;
+  const tp3 = tps.length > 2 ? tps[2] : null;
+  if (!tp1) return null;
 
-const rr = Math.abs(entryMid - tp1) / Math.abs(entryMid - stop);
-const riskPct = Math.abs(stop - entryMid) / entryMid;
-const tp1Pct = Math.abs(entryMid - tp1) / entryMid;
-// 硬门槛：TP1 必须够波段距离且盈亏比过线，否则不出（不硬凑波段）
-if (tp1Pct <= GRADE_SHORT || rr < MIN_RR) return null;
+  const rr = Math.abs(entryMid - tp1) / Math.abs(entryMid - stop);
+  const riskPct = Math.abs(stop - entryMid) / entryMid;
+  const tp1Pct = Math.abs(entryMid - tp1) / entryMid;
+  // 硬门槛：TP1 必须够波段距离且盈亏比过线，否则不出（不硬凑波段）
+  if (tp1Pct <= GRADE_SHORT || rr < MIN_RR) return null;
 
-const warnMsg = riskPct > WIDE_STOP_PCT? `⚠️ 止损过宽 ${(riskPct * 100).toFixed(1)}%`: "";
-const grade = tp1Pct < GRADE_ULTRA? "超短线": tp1Pct <= GRADE_SHORT? "短线": "波段";
-const invalidText = isLong? `1H 收盘跌破 ${formatPrice(level)}`: `1H 收盘站上 ${formatPrice(level)}`;
-const reasons = isLong
-? `${trend4 === "BULL"? "4H趋势偏多": "4H中性"} · ${modeText} 1H 支撑 ${formatPrice(level)} · 15M 企稳确认`
-: `${trend4 === "BEAR"? "4H趋势偏空": "4H中性"} · ${modeText} 1H 阻力 ${formatPrice(level)} · 15M 滞涨确认`;
+  const warnMsg = riskPct > WIDE_STOP_PCT ? `⚠️ 止损过宽 ${(riskPct * 100).toFixed(1)}%` : "";
+  const grade = tp1Pct < GRADE_ULTRA ? "超短线" : tp1Pct <= GRADE_SHORT ? "短线" : "波段";
+  const invalidText = isLong ? `1H 收盘跌破 ${formatPrice(level)}` : `1H 收盘站上 ${formatPrice(level)}`;
+  const reasons = isLong
+    ? `${trend4 === "BULL" ? "4H趋势偏多" : "4H中性"} · ${modeText} 1H 支撑 ${formatPrice(level)} · 15M 企稳确认`
+    : `${trend4 === "BEAR" ? "4H趋势偏空" : "4H中性"} · ${modeText} 1H 阻力 ${formatPrice(level)} · 15M 滞涨确认`;
 
-return {
-track: "SWING", side, type: `波段${isLong? "做多": "做空"} · ${modeText}`,
-reasons, entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade,
-netDist: null, invalidText, invVal: level, invTf: "1h", score: null
-};
+  return {
+    track: "SWING", side, type: `波段${isLong ? "做多" : "做空"} · ${modeText}`,
+    reasons, entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade,
+    netDist: null, invalidText, invVal: level, invTf: "1h", score: null
+  };
 }
 
 function formatPrice(value) {
-if (value === null || value === undefined ||!Number.isFinite(value)) return "--";
-if (value >= 1000) return value.toFixed(2);
-if (value >= 100) return value.toFixed(3);
-if (value >= 1) return value.toFixed(4);
-return value.toFixed(6);
+  if (value === null || value === undefined || !Number.isFinite(value)) return "--";
+  if (value >= 1000) return value.toFixed(2);
+  if (value >= 100) return value.toFixed(3);
+  if (value >= 1) return value.toFixed(4);
+  return value.toFixed(6);
 }
 
 // ===== 渲染主界面 =====
 function renderCard(d) {
-let badge = "none", badgeText = "观望", cardClass = "";
-const isRev = d.type && d.type.includes('逆势');
+  let badge = "none", badgeText = "观望", cardClass = "";
+  const isRev = d.type && d.type.includes('逆势'); 
 
-if (d.side === "LONG") {
-badge = isRev? "reversal": "long";
-badgeText = d.type;
-cardClass = isRev? "reversal": "long";
-}
-else if (d.side === "SHORT") {
-badge = isRev? "reversal": "short";
-badgeText = d.type;
-cardClass = isRev? "reversal": "short";
-}
-else if (d.side === "WATCH") { badge = "watch"; badgeText = d.type;}
-// 短线无信号但波段有信号时，卡片徽章借用波段方向
-if (d.side === "NONE" && d.swing) {
-badge = d.swing.side === "LONG"? "long": "short";
-badgeText = d.swing.type;
-cardClass = d.swing.side === "LONG"? "long": "short";
-}
+  if (d.side === "LONG") { 
+    badge = isRev ? "reversal" : "long"; 
+    badgeText = d.type; 
+    cardClass = isRev ? "reversal" : "long"; 
+  }
+  else if (d.side === "SHORT") { 
+    badge = isRev ? "reversal" : "short"; 
+    badgeText = d.type; 
+    cardClass = isRev ? "reversal" : "short"; 
+  }
+  else if (d.side === "WATCH") { badge = "watch"; badgeText = d.type; }
+  // 短线无信号但波段有信号时，卡片徽章借用波段方向
+  if (d.side === "NONE" && d.swing) {
+    badge = d.swing.side === "LONG" ? "long" : "short";
+    badgeText = d.swing.type;
+    cardClass = d.swing.side === "LONG" ? "long" : "short";
+  }
 
-const changeClass = d.changePct >= 0? "up": "down";
-const change = (d.changePct >= 0? "+": "") + d.changePct.toFixed(2) + "%";
+  const changeClass = d.changePct >= 0 ? "up" : "down";
+  const change = (d.changePct >= 0 ? "+" : "") + d.changePct.toFixed(2) + "%";
+  
+  let plan = "";
+  if (d.entry && d.stop !== null) {
+    plan = `
+    <div class="plan">
+      <div class="plan-title">交易计划参考</div>
+      <div class="meta">
+        <div class="meta-item"><div class="label">参考入场区</div><div class="value">${formatPrice(d.entry[0])} - ${formatPrice(d.entry[1])}</div></div>
+        <div class="meta-item"><div class="label">止损 SL</div><div class="value red">${formatPrice(d.stop)}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP1</div><div class="value green">${d.tp1 ? formatPrice(d.tp1) : "--"}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP2</div><div class="value green">${d.tp2 ? formatPrice(d.tp2) : "--"}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP3</div><div class="value green">${d.tp3 ? formatPrice(d.tp3) : "--"}</div></div>
+        <div class="meta-item"><div class="label">真实盈亏比</div><div class="value">${d.rr ? d.rr.toFixed(2) : "--"} : 1</div></div>
+      </div>
+      <div class="plan-note">失效（收盘）：${d.invalidText}，逻辑失效，提前离场不等止损</div>
+      <div class="plan-note">止损（触价）：${formatPrice(d.stop)}，触价即走</div>
+    </div>`;
+  }
 
-let plan = "";
-if (d.entry && d.stop!== null) {
-plan = `
-<div class="plan">
-<div class="plan-title">交易计划参考</div>
-<div class="meta">
-<div class="meta-item"><div class="label">参考入场区</div><div class="value">${formatPrice(d.entry[0])} - ${formatPrice(d.entry[1])}</div></div>
-<div class="meta-item"><div class="label">止损 SL</div><div class="value red">${formatPrice(d.stop)}</div></div>
-<div class="meta-item"><div class="label">止盈 TP1</div><div class="value green">${d.tp1? formatPrice(d.tp1): "--"}</div></div>
-<div class="meta-item"><div class="label">止盈 TP2</div><div class="value green">${d.tp2? formatPrice(d.tp2): "--"}</div></div>
-<div class="meta-item"><div class="label">止盈 TP3</div><div class="value green">${d.tp3? formatPrice(d.tp3): "--"}</div></div>
-<div class="meta-item"><div class="label">真实盈亏比</div><div class="value">${d.rr? d.rr.toFixed(2): "--"}: 1</div></div>
-</div>
-<div class="plan-note">失效（收盘）：${d.invalidText}，逻辑失效，提前离场不等止损</div>
-<div class="plan-note">止损（触价）：${formatPrice(d.stop)}，触价即走</div>
-</div>`;
-}
+  let swingPlan = "";
+  if (d.swing) {
+    const sw = d.swing;
+    const conflict = (d.side === "LONG" && sw.side === "SHORT") || (d.side === "SHORT" && sw.side === "LONG");
+    swingPlan = `
+    <div class="plan">
+      <div class="plan-title">波段计划参考 · ${sw.type}</div>
+      <div class="reason">${sw.reasons}</div>
+      ${sw.warnMsg ? `<div class="warn-tag">${sw.warnMsg}</div>` : ""}
+      <div class="meta">
+        <div class="meta-item"><div class="label">参考入场区</div><div class="value">${formatPrice(sw.entry[0])} - ${formatPrice(sw.entry[1])}</div></div>
+        <div class="meta-item"><div class="label">止损 SL</div><div class="value red">${formatPrice(sw.stop)}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP1</div><div class="value green">${sw.tp1 ? formatPrice(sw.tp1) : "--"}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP2</div><div class="value green">${sw.tp2 ? formatPrice(sw.tp2) : "--"}</div></div>
+        <div class="meta-item"><div class="label">止盈 TP3</div><div class="value green">${sw.tp3 ? formatPrice(sw.tp3) : "--"}</div></div>
+        <div class="meta-item"><div class="label">真实盈亏比</div><div class="value">${sw.rr ? sw.rr.toFixed(2) : "--"} : 1</div></div>
+      </div>
+      <div class="plan-note">失效（收盘）：${sw.invalidText}，逻辑失效，提前离场不等止损</div>
+      <div class="plan-note">止损（触价）：${formatPrice(sw.stop)}，触价即走</div>
+      ${conflict ? `<div class="plan-note" style="color:var(--yellow)">⚠️ 与短线方向冲突：以波段为准，短线单按短打处理（TP1 为主）</div>` : ""}
+    </div>`;
+  }
 
-let swingPlan = "";
-if (d.swing) {
-const sw = d.swing;
-const conflict = (d.side === "LONG" && sw.side === "SHORT") || (d.side === "SHORT" && sw.side === "LONG");
-swingPlan = `
-<div class="plan">
-<div class="plan-title">波段计划参考 · ${sw.type}</div>
-<div class="reason">${sw.reasons}</div>
-${sw.warnMsg? `<div class="warn-tag">${sw.warnMsg}</div>`: ""}
-<div class="meta">
-<div class="meta-item"><div class="label">参考入场区</div><div class="value">${formatPrice(sw.entry[0])} - ${formatPrice(sw.entry[1])}</div></div>
-<div class="meta-item"><div class="label">止损 SL</div><div class="value red">${formatPrice(sw.stop)}</div></div>
-<div class="meta-item"><div class="label">止盈 TP1</div><div class="value green">${sw.tp1? formatPrice(sw.tp1): "--"}</div></div>
-<div class="meta-item"><div class="label">止盈 TP2</div><div class="value green">${sw.tp2? formatPrice(sw.tp2): "--"}</div></div>
-<div class="meta-item"><div class="label">止盈 TP3</div><div class="value green">${sw.tp3? formatPrice(sw.tp3): "--"}</div></div>
-<div class="meta-item"><div class="label">真实盈亏比</div><div class="value">${sw.rr? sw.rr.toFixed(2): "--"}: 1</div></div>
-</div>
-<div class="plan-note">失效（收盘）：${sw.invalidText}，逻辑失效，提前离场不等止损</div>
-<div class="plan-note">止损（触价）：${formatPrice(sw.stop)}，触价即走</div>
-${conflict? `<div class="plan-note" style="color:var(--yellow)">⚠️ 与短线方向冲突：以波段为准，短线单按短打处理（TP1 为主）</div>`: ""}
-</div>`;
-}
+  const revTag = isRev ? '<span class="tag reversal">逆势短线</span>' : '';
+  const isShow = d.group === currentTab ? 'show' : '';
+  const warnClass = d.warnMsg ? "warn" : "";
 
-const revTag = isRev? '<span class="tag reversal">逆势短线</span>': '';
-const isShow = d.group === currentTab? 'show': '';
-const warnClass = d.warnMsg? "warn": "";
-
-return `
-<div class="card ${cardClass} ${warnClass} ${isShow}" data-group="${d.group}">
-<div class="card-header">
-<div>
-<div class="symbol">${d.name}/USDT</div>
-<div>
-<span class="price">${d.price > 0? formatPrice(d.price): "--"}</span>
-<span class="change ${changeClass}">${d.price > 0? change: "--"}</span>
-</div>
-<div class="ticker-line">报价更新 · ${d.ticker? new Date(d.ticker.receivedAt).toLocaleTimeString("zh-CN", { hour12: false}): "--"}</div>
-<div class="ticker-line">标记价 <strong>${d.ticker && d.ticker.markPrice!== null? formatPrice(d.ticker.markPrice): "--"}</strong>　指数价 <strong>${d.ticker && d.ticker.indexPrice!== null? formatPrice(d.ticker.indexPrice): "--"}</strong></div>
-</div>
-<div class="badge ${badge}">${badgeText}</div>
-</div>
-<div class="reason">${d.reasons}</div>
-<div class="score">策略评分：${d.score.toFixed(1)}/5　多头 ${d.longScore.toFixed(1)} 分 / 空头 ${d.shortScore.toFixed(1)} 分</div>
-
-${d.warnMsg? `<div class="warn-tag">${d.warnMsg}</div>`: ""}
-${d.grade? `<div class="grade-tag">级别：${d.grade}${d.grade === "超短线" && d.netDist!== null && d.netDist!== undefined? ` · 扣费后净距离 ≈ ${d.netDist < 0? "-": ""}${formatPrice(Math.abs(d.netDist))}`: ""}</div>`: ""}
-
-<div class="meta">
-<div class="meta-item"><div class="label">4H大趋势</div><div class="value">${trendText(d.trend4)}</div></div>
-<div class="meta-item"><div class="label">1H方向</div><div class="value">${trendText(d.trend1)}</div></div>
-<div class="meta-item"><div class="label">15M结构</div><div class="value">${trendText(d.trend15)}</div></div>
-<div class="meta-item"><div class="label">5M成交量</div><div class="value">${d.volOk? "放量": "未放量"}</div></div>
-<div class="meta-item"><div class="label">5M RSI</div><div class="value">${d.rsiValue === null? "--": d.rsiValue.toFixed(1)}</div></div>
-<div class="meta-item"><div class="label">背离检测</div><div class="value">${d.div.bull? "底背离": d.div.bear? "顶背离": "无明显背离"}</div></div>
-</div>
-
-${plan}
-${swingPlan}
-
-<div class="tags">
-<span class="tag ${d.trend4 === "BULL"? "on": d.trend4 === "BEAR"? "off": ""}">4H趋势</span>
-<span class="tag ${d.trend1 === "BULL"? "on": d.trend1 === "BEAR"? "off": ""}">1H方向</span>
-<span class="tag ${d.volOk? "on": ""}">成交量过滤</span>
-<span class="tag ${d.div.bull? "on": d.div.bear? "off": ""}">RSI背离</span>
-${revTag}
-</div>
-</div>`;
+  return `
+  <div class="card ${cardClass} ${warnClass} ${isShow}" data-group="${d.group}">
+    <div class="card-header">
+      <div>
+        <div class="symbol">${d.name}/USDT</div>
+        <div>
+          <span class="price" data-live-price="${d.symbolId}">${d.price > 0 ? formatPrice(d.price) : "--"}</span>
+          <span class="change ${changeClass}">${d.price > 0 ? change : "--"}</span>
+        </div>
+        <div class="ticker-line">报价更新 · ${d.ticker ? new Date(d.ticker.receivedAt).toLocaleTimeString("zh-CN", { hour12: false }) : "--"}</div>
+        <div class="ticker-line">标记价 <strong>${d.ticker && d.ticker.markPrice !== null ? formatPrice(d.ticker.markPrice) : "--"}</strong>　指数价 <strong>${d.ticker && d.ticker.indexPrice !== null ? formatPrice(d.ticker.indexPrice) : "--"}</strong></div>
+      </div>
+      <div class="badge ${badge}">${badgeText}</div>
+    </div>
+    <div class="reason">${d.reasons}</div>
+    <div class="score">策略评分：${d.score.toFixed(1)}/5　多头 ${d.longScore.toFixed(1)} 分 / 空头 ${d.shortScore.toFixed(1)} 分</div>
+    
+    ${d.warnMsg ? `<div class="warn-tag">${d.warnMsg}</div>` : ""}
+    ${d.grade ? `<div class="grade-tag">级别：${d.grade}${d.grade === "超短线" && d.netDist !== null && d.netDist !== undefined ? ` · 扣费后净距离 ≈ ${d.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(d.netDist))}` : ""}</div>` : ""}
+    
+    <div class="meta">
+      <div class="meta-item"><div class="label">4H大趋势</div><div class="value">${trendText(d.trend4)}</div></div>
+      <div class="meta-item"><div class="label">1H方向</div><div class="value">${trendText(d.trend1)}</div></div>
+      <div class="meta-item"><div class="label">15M结构</div><div class="value">${trendText(d.trend15)}</div></div>
+      <div class="meta-item"><div class="label">5M成交量</div><div class="value">${d.volOk ? "放量" : "未放量"}</div></div>
+      <div class="meta-item"><div class="label">5M RSI</div><div class="value">${d.rsiValue === null ? "--" : d.rsiValue.toFixed(1)}</div></div>
+      <div class="meta-item"><div class="label">背离检测</div><div class="value">${d.div.bull ? "底背离" : d.div.bear ? "顶背离" : "无明显背离"}</div></div>
+    </div>
+    
+    ${plan}
+    ${swingPlan}
+    
+    <div class="tags">
+      <span class="tag ${d.trend4 === "BULL" ? "on" : d.trend4 === "BEAR" ? "off" : ""}">4H趋势</span>
+      <span class="tag ${d.trend1 === "BULL" ? "on" : d.trend1 === "BEAR" ? "off" : ""}">1H方向</span>
+      <span class="tag ${d.volOk ? "on" : ""}">成交量过滤</span>
+      <span class="tag ${d.div.bull ? "on" : d.div.bear ? "off" : ""}">RSI背离</span>
+      ${revTag}
+    </div>
+  </div>`;
 }
 
 function trendText(value) {
-if (value === "BULL") return '<span class="green">偏多</span>';
-if (value === "BEAR") return '<span class="red">偏空</span>';
-return "中性";
+  if (value === "BULL") return '<span class="green">偏多</span>';
+  if (value === "BEAR") return '<span class="red">偏空</span>';
+  return "中性";
 }
 
 function setStatus(type, text) {
-document.getElementById("statusDot").className = "dot " + type;
-document.getElementById("statusText").textContent = text;
+  document.getElementById("statusDot").className = "dot " + type;
+  document.getElementById("statusText").textContent = text;
 }
 
 // ===== 核心加载逻辑 =====
 async function loadOne(symbol) {
-const ticker = tickerCache[symbol.id];
-if (!ticker) throw new Error(symbol.id + " 暂无报价");
-const [k4h, k1h, k15, k5] = await Promise.all([
-fetchKlines(symbol.id, "4h"), fetchKlines(symbol.id, "1h"),
-fetchKlines(symbol.id, "15m"), fetchKlines(symbol.id, "5m")
-]);
-return analyze(symbol, k4h, k1h, k15, k5, ticker);
+  const ticker = tickerCache[symbol.id];
+  if (!ticker) throw new Error(symbol.id + " 暂无报价");
+  const [k4h, k1h, k15, k5] = await Promise.all([
+    fetchKlines(symbol.id, "4h"), fetchKlines(symbol.id, "1h"),
+    fetchKlines(symbol.id, "15m"), fetchKlines(symbol.id, "5m")
+  ]);
+  return analyze(symbol, k4h, k1h, k15, k5, ticker);
 }
 
 async function loadAll() {
-if (busy) return;
-busy = true;
-const btn = document.getElementById("refreshBtn");
-btn.disabled = true;
-setStatus("loading", "正在读取行情K线...");
-document.getElementById("errorBox").style.display = "none";
-
-try {
-await refreshTickerSnapshot();
-
-const results = await Promise.all(SYMBOLS.map(async symbol => {
-try {
-return await loadOne(symbol);
-} catch (error) {
-return {
-name: symbol.name, symbolId: symbol.id, group: symbol.group, price: 0, changePct: 0, side: "NONE", type: "数据获取失败",
-score: 0, reasons: error.message || "行情读取失败",
-trend4: "NEUTRAL", trend1: "NEUTRAL", trend15: "NEUTRAL",
-volOk: false, rsiValue: null, div: { bull: false, bear: false},
-entry: null, stop: null, tp1: null, tp2: null, tp3: null, rr: null,
-riskPct: null, warnMsg: null, grade: null, netDist: null, invalidText: "",
-invVal: null, invTf: "15m", lastClose15: null, lastClose1h: null, swing: null,
-longScore: 0, shortScore: 0, lastBarHigh: null, lastBarLow: null
-};
-}
-}));
-
-const newSignalSet = new Set();
-let hasNewRecord = false;
-
-for (const r of results) {
-// 每个币种每轮都做记录追踪（不再要求当前必须有新信号）
-if (r.price > 0) {
-checkRecordTriggers(r.symbolId, r.price, r.lastBarHigh, r.lastBarLow);
-checkInvalidation(r.symbolId, r.lastClose15, r.lastClose1h);
-}
-if (r.side === "LONG" || r.side === "SHORT") {
-newSignalSet.add(r.symbolId + "_" + r.side);
-const added = addRecordIfNeed(r);
-if (added) {
-hasNewRecord = true;
-}
-}
-// 波段线：独立入池（带 SWING 标记，与短线记录分开去重、分开算有效期）
-if (r.swing) {
-const addedSwing = addRecordIfNeed({...r.swing, name: r.name, symbolId: r.symbolId});
-if (addedSwing) {
-hasNewRecord = true;
-}
-}
-}
-
-lastSignalKey = newSignalSet;
-document.getElementById("cards").innerHTML = results.map(renderCard).join("");
-
-const btns = document.querySelectorAll('.tab-btn');
-btns.forEach((b, index) => {
-if (index === ["group1", "group2", "group3", "group4"].indexOf(currentTab)) b.classList.add('active');
-else b.classList.remove('active');
-});
-
-if (results.filter(x => x.price > 0).length === 0) {
-throw new Error("所有币种行情获取失败");
-}
-
-if (hasNewRecord) {
-playBeep();
-}
-
-const now = new Date();
-document.getElementById("lastUpdate").textContent = now.toLocaleTimeString("zh-CN", { hour12: false});
-setStatus("live", "行情已就绪");
-
-const failed = results.filter(x => x.price === 0);
-if (failed.length) {
-const box = document.getElementById("errorBox");
-box.style.display = "block";
-box.textContent = "部分币种读取失败：" + failed.map(x => x.name + "（" + x.reasons + "）").join("；");
-}
-} catch (error) {
-setStatus("error", "更新失败");
-const box = document.getElementById("errorBox");
-box.style.display = "block";
-box.textContent = error.message;
-} finally {
-busy = false;
-btn.disabled = false;
-}
+  if (busy) return;
+  busy = true;
+  const btn = document.getElementById("refreshBtn");
+  btn.disabled = true;
+  setStatus("loading", "正在读取行情K线...");
+  document.getElementById("errorBox").style.display = "none";
+  
+  try {
+    await refreshTickerSnapshot();
+    
+    const results = await Promise.all(SYMBOLS.map(async symbol => {
+      try {
+        return await loadOne(symbol);
+      } catch (error) {
+        return {
+          name: symbol.name, symbolId: symbol.id, group: symbol.group, price: 0, changePct: 0, side: "NONE", type: "数据获取失败",
+          score: 0, reasons: error.message || "行情读取失败",
+          trend4: "NEUTRAL", trend1: "NEUTRAL", trend15: "NEUTRAL",
+          volOk: false, rsiValue: null, div: { bull: false, bear: false },
+          entry: null, stop: null, tp1: null, tp2: null, tp3: null, rr: null,
+          riskPct: null, warnMsg: null, grade: null, netDist: null, invalidText: "",
+          invVal: null, invTf: "15m", lastClose15: null, lastClose1h: null, swing: null,
+          longScore: 0, shortScore: 0, lastBarHigh: null, lastBarLow: null
+        };
+      }
+    }));
+    
+    const newSignalSet = new Set();
+    let hasNewRecord = false;
+    
+    for (const r of results) {
+      // 每个币种每轮都做记录追踪（不再要求当前必须有新信号）
+      if (r.price > 0) {
+        checkRecordTriggers(r.symbolId, r.price, r.lastBarHigh, r.lastBarLow);
+        checkInvalidation(r.symbolId, r.lastClose15, r.lastClose1h);
+      }
+      if (r.side === "LONG" || r.side === "SHORT") {
+        newSignalSet.add(r.symbolId + "_" + r.side);
+        const added = addRecordIfNeed(r);
+        if (added) {
+          hasNewRecord = true;
+        }
+      }
+      // 波段线：独立入池（带 SWING 标记，与短线记录分开去重、分开算有效期）
+      if (r.swing) {
+        const addedSwing = addRecordIfNeed({ ...r.swing, name: r.name, symbolId: r.symbolId });
+        if (addedSwing) {
+          hasNewRecord = true;
+        }
+      }
+    }
+    
+    lastSignalKey = newSignalSet;
+    document.getElementById("cards").innerHTML = results.map(renderCard).join("");
+    
+    const btns = document.querySelectorAll('.tab-btn');
+    btns.forEach((b, index) => {
+        if (index === ["group1", "group2", "group3", "group4"].indexOf(currentTab)) b.classList.add('active');
+        else b.classList.remove('active');
+    });
+    
+    if (results.filter(x => x.price > 0).length === 0) {
+      throw new Error("所有币种行情获取失败");
+    }
+    
+    if (hasNewRecord) {
+      playBeep();
+    }
+    
+    const now = new Date();
+    document.getElementById("lastUpdate").textContent = now.toLocaleTimeString("zh-CN", { hour12: false });
+    setStatus("live", "行情已就绪");
+    
+    const failed = results.filter(x => x.price === 0);
+    if (failed.length) {
+      const box = document.getElementById("errorBox");
+      box.style.display = "block";
+      box.textContent = "部分币种读取失败：" + failed.map(x => x.name + "（" + x.reasons + "）").join("；");
+    }
+  } catch (error) {
+    setStatus("error", "更新失败");
+    const box = document.getElementById("errorBox");
+    box.style.display = "block";
+    box.textContent = error.message;
+  } finally {
+    busy = false;
+    btn.disabled = false;
+  }
 }
 
 function startTimer() {
-if (timer) clearInterval(timer);
-timer = setInterval(loadAll, 30000);
+  if (timer) clearInterval(timer);
+  timer = setInterval(loadAll, 30000);
+}
+
+// ===== WebSocket 实时层（v3 新增：秒级价格 + 逐笔触碰盖章） =====
+// 只负责"看见"：实时价显示与止损/止盈触碰章。信号计算与失效盖章仍走 REST 收盘口径，这里永不盖失效章。
+const WS_URL = "wss://ws-contract.weex.com/v3/ws";
+const WS_BACKOFF = [3000, 5000, 10000, 30000];
+let wsConn = null;
+let wsHeartbeatTimer = null;
+let wsReconnectTimer = null;
+let wsBackoffIdx = 0;
+const wsLastDomUpdate = Object.create(null);
+
+function setWsStatus(text) {
+  const el = document.getElementById("wsStatus");
+  if (el) el.textContent = text;
+}
+
+function wsShouldRun() {
+  return autoRefresh && !document.hidden;
+}
+
+function connectWs() {
+  if (!wsShouldRun()) { setWsStatus("实时：已断·轮询中"); return; }
+  if (typeof WebSocket === "undefined") { setWsStatus("实时：已断·轮询中"); return; }
+  if (wsConn && (wsConn.readyState === 0 || wsConn.readyState === 1)) return;
+  setWsStatus("实时：连接中");
+  let sock;
+  try { sock = new WebSocket(WS_URL); } catch (e) { scheduleWsReconnect(); return; }
+  wsConn = sock;
+  sock.onopen = function() {
+    wsBackoffIdx = 0;
+    setWsStatus("实时：已连");
+    const args = SYMBOLS.map(s => ({ channel: "ticker", instId: "cmt_" + s.id.toLowerCase() }));
+    try { sock.send(JSON.stringify({ op: "subscribe", args })); } catch (e) {}
+    startWsHeartbeat();
+  };
+  sock.onmessage = function(ev) { handleWsMessage(ev && ev.data); };
+  sock.onerror = function() { try { sock.close(); } catch (e) {} };
+  sock.onclose = function() {
+    if (wsConn === sock) wsConn = null;
+    stopWsHeartbeat();
+    setWsStatus("实时：已断·轮询中");
+    scheduleWsReconnect();
+  };
+}
+
+function disconnectWs() {
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  stopWsHeartbeat();
+  if (wsConn) {
+    const s = wsConn; wsConn = null;
+    s.onopen = s.onmessage = s.onerror = s.onclose = null;
+    try { s.close(); } catch (e) {}
+  }
+  setWsStatus("实时：已断·轮询中");
+}
+
+function startWsHeartbeat() {
+  stopWsHeartbeat();
+  wsHeartbeatTimer = setInterval(() => {
+    if (wsConn && wsConn.readyState === 1) {
+      try { wsConn.send("ping"); } catch (e) {}
+    }
+  }, 25000);
+}
+function stopWsHeartbeat() {
+  if (wsHeartbeatTimer) { clearInterval(wsHeartbeatTimer); wsHeartbeatTimer = null; }
+}
+
+function scheduleWsReconnect() {
+  if (wsReconnectTimer) return;
+  if (!wsShouldRun()) { setWsStatus("实时：已断·轮询中"); return; }
+  const delay = WS_BACKOFF[Math.min(wsBackoffIdx, WS_BACKOFF.length - 1)];
+  wsBackoffIdx++;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    if (wsShouldRun()) connectWs();
+  }, delay);
+}
+
+// 页面隐藏时关连接省电省流量，切回前台自动重连
+document.addEventListener("visibilitychange", function() {
+  if (document.hidden) disconnectWs();
+  else if (autoRefresh) connectWs();
+});
+
+function pickWsPrice(item) {
+  const fields = ["lastPr", "lastPrice", "last", "c", "price"];
+  for (const f of fields) {
+    const v = Number(item[f]);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  return null;
+}
+
+// 防御式解析：推送的确切外形未经实测验证，几种常见形状都兼容；认不出就忽略，REST 轮询兜底
+function handleWsMessage(raw) {
+  if (typeof raw !== "string") return;
+  const text = raw.trim();
+  if (text === "pong") return; // 心跳回应，连接活着即可
+  if (text === "ping") {
+    if (wsConn && wsConn.readyState === 1) { try { wsConn.send("pong"); } catch (e) {} }
+    return;
+  }
+  let msg;
+  try { msg = JSON.parse(text); } catch (e) { return; }
+  if (!msg || typeof msg !== "object") return;
+  if (msg.event) return; // subscribe / error 等事件帧，忽略
+
+  let channel = "", instId = "";
+  if (msg.arg && typeof msg.arg === "object") {
+    channel = String(msg.arg.channel || "");
+    instId = String(msg.arg.instId || "");
+  }
+  if (typeof msg.channel === "string") {
+    if (!channel) channel = msg.channel;
+    const m = msg.channel.match(/^ticker\.(.+)$/);
+    if (m && !instId) instId = m[1];
+  }
+  if (channel && channel.indexOf("ticker") !== 0) return; // 只订阅了 ticker，其它频道不处理
+
+  let items = [];
+  if (Array.isArray(msg.data)) items = msg.data;
+  else if (msg.data && typeof msg.data === "object") items = [msg.data];
+  else items = [msg];
+
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const symRaw = instId || item.instId || item.symbol || item.s || "";
+    const symbolId = String(symRaw).toUpperCase().replace(/^CMT_/, "");
+    if (!SYMBOLS.some(s => s.id === symbolId)) continue;
+    const price = pickWsPrice(item);
+    if (price === null) continue;
+    onWsTick(symbolId, price);
+  }
+}
+
+function onWsTick(symbolId, price) {
+  const prev = tickerCache[symbolId];
+  const oldPrice = prev ? prev.lastPrice : null;
+  if (prev) {
+    prev.lastPrice = price;
+    prev.receivedAt = Date.now();
+  } else {
+    tickerCache[symbolId] = { lastPrice: price, markPrice: null, indexPrice: null, changePct: null, eventTime: Date.now(), receivedAt: Date.now() };
+  }
+  updateLivePriceDom(symbolId, price, oldPrice);
+  checkRecordTriggersTick(symbolId, price);
+}
+
+function updateLivePriceDom(symbolId, price, oldPrice) {
+  const nowMs = Date.now();
+  const last = wsLastDomUpdate[symbolId] || 0;
+  if (nowMs - last < 250) return; // 节流：每币种最多约 4 次/秒
+  wsLastDomUpdate[symbolId] = nowMs;
+  if (typeof document.querySelector !== "function") return;
+  const el = document.querySelector('[data-live-price="' + symbolId + '"]');
+  if (!el) return;
+  el.textContent = formatPrice(price);
+  if (oldPrice !== null && oldPrice !== undefined && price !== oldPrice && el.style) {
+    el.style.color = price > oldPrice ? "var(--green)" : "var(--red)";
+    setTimeout(() => { el.style.color = ""; }, 600);
+  }
+}
+
+// 逐笔触碰判定（只盖止损/止盈章；失效章是收盘口径，永远不在这里盖）
+function checkRecordTriggersTick(symbolId, price) {
+  if (!price || price <= 0) return false;
+  const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  let changed = false;
+  for (const r of recordPool) {
+    if (r.symbolId !== symbolId) continue;
+    if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
+    const isLong = r.side === 'LONG';
+    const hitSL = !r.timeSL && (isLong ? price <= r.stopVal : price >= r.stopVal);
+    if (hitSL) {
+      r.timeSL = now; changed = true;
+    }
+    // 与 K 线口径一致：同一 tick 先触止损则本 tick 不盖止盈章（保守）
+    if (!hitSL) {
+      if (!r.timeTP1 && r.tp1Val) {
+        if ((isLong && price >= r.tp1Val) || (!isLong && price <= r.tp1Val)) { r.timeTP1 = now; changed = true; }
+      }
+      if (!r.timeTP2 && r.tp2Val) {
+        if ((isLong && price >= r.tp2Val) || (!isLong && price <= r.tp2Val)) { r.timeTP2 = now; changed = true; }
+      }
+      if (!r.timeTP3 && r.tp3Val) {
+        if ((isLong && price >= r.tp3Val) || (!isLong && price <= r.tp3Val)) { r.timeTP3 = now; changed = true; }
+      }
+    }
+  }
+  if (changed) {
+    saveRecords();
+    renderRecordPool();
+  }
+  return changed;
 }
 
 // ===== 启动 =====
 initTheme();
-loadRecords();
+loadRecords(); 
 renderRecordPool();
 loadAll();
 startTimer();
+connectWs();
 
 </script>
 </body>
