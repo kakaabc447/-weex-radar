@@ -95,6 +95,10 @@ display: none; /* 默认隐藏，通过 JS 控制显示 */
 .grade-tag { font-size: 11px; padding: 3px 6px; border-radius: 4px; background: rgba(59,130,246,.12); color: var(--blue); border: 1px solid var(--blue); margin-top: 6px; display: inline-block; font-weight: bold;}
 .swing-tag { font-size: 11px; padding: 3px 6px; border-radius: 4px; background: rgba(168,85,247,.12); color: #a855f7; border: 1px solid #a855f7; margin-top: 6px; display: inline-block; font-weight: bold;}
 .invalid-tag { font-size: 11px; padding: 3px 6px; border-radius: 4px; background: rgba(239,68,68,.15); color: var(--red); border: 1px solid var(--red); margin-top: 6px; display: inline-block; font-weight: bold;}
+.follow-tag { font-size: 11px; padding: 3px 6px; border-radius: 4px; margin-top: 6px; display: inline-block; font-weight: bold;}
+.follow-tag.good { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid var(--green);}
+.follow-tag.mid { background: rgba(234,179,8,.15); color: var(--yellow); border: 1px solid var(--yellow);}
+.follow-tag.bad { background: rgba(239,68,68,.15); color: var(--red); border: 1px solid var(--red);}
 .expired-tag { font-size: 11px; padding: 3px 6px; border-radius: 4px; background: rgba(139,147,167,.15); color: var(--muted); border: 1px solid var(--muted); margin-top: 6px; display: inline-block; font-weight: bold;}
 
 .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px;}
@@ -166,6 +170,11 @@ position: relative;
 .record-time { font-size: 11px; color: var(--muted); background: var(--item-bg); padding: 2px 6px; border-radius: 4px;}
 .record-symbol { font-weight: bold; font-size: 15px;}
 .trigger-time { font-size: 10px; color: var(--yellow); margin-left: 6px; font-weight: normal;}
+.record-summary { cursor: pointer;}
+.key-line { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6;}
+.key-line b { color: var(--text); font-weight: 650;}
+.rec-arrow { color: var(--muted); font-size: 13px; margin-left: 8px;}
+.record-detail { margin-top: 2px;}
 </style>
 </head>
 <body>
@@ -209,7 +218,7 @@ position: relative;
 
 <div class="footer-note">
 行情来源：WEEX 合约公开接口<br>
-结构位判定 · 真实盈亏比挂牌 · 注意风险控制 · v3.1（波段线 + 失效盖章 + 秒级实时）
+结构位判定 · 真实盈亏比挂牌 · 注意风险控制 · v3.4（波段线 + 失效盖章 + 秒级实时 + 级别预计时间 + 跟进提示 + 记录池折叠）
 </div>
 
 <div class="actions">
@@ -241,6 +250,25 @@ const WIDE_STOP_PCT = 0.04, MIN_RR = 1.2;
 // 级别判定常量（按 TP1 距离占入场价比例）
 const GRADE_ULTRA = 0.006, GRADE_SHORT = 0.02;
 const FEE_RT = 0.0016; // 往返手续费约 0.16%
+// 级别与预计到达时间（v3.2）：按「TP1 距离 ÷ 该周期 ATR」的平方估算所需 K 线数，再换算成分钟
+// estMinutes 同时决定级别与文案；ATR 无效时回退到旧的百分比级别且不显示预计时间
+function gradeAndEta(dist, atr, tfMinutes, pctFallback) {
+  if (!Number.isFinite(atr) || atr <= 0 || !Number.isFinite(dist)) {
+    return { grade: pctFallback, etaText: "" };
+  }
+  const d = dist / atr;
+  const estMinutes = d * d * tfMinutes;
+  const grade = estMinutes <= 30 ? "超短线" : estMinutes <= 240 ? "短线" : "波段";
+  let etaText;
+  if (estMinutes <= 20) etaText = "约15分钟";
+  else if (estMinutes <= 40) etaText = "约半小时";
+  else if (estMinutes <= 90) etaText = "约1小时";
+  else if (estMinutes <= 180) etaText = "约2小时";
+  else if (estMinutes <= 300) etaText = "约3–4小时";
+  else if (estMinutes <= 720) etaText = "约半天";
+  else etaText = "可能跨夜";
+  return { grade, etaText };
+}
 // TP 结构位筛选常量
 const TP_MIN_DIST_ATR = 0.5, TP_MERGE_ATR = 0.3;
 // 记录有效期（24 小时）
@@ -255,6 +283,7 @@ let busy = false;
 let soundEnable = true;
 let lastSignalKey = new Set();
 let recordPool = [];
+const expandedRecords = new Set(); // 记录池折叠状态（仅本次打开期间有效，刷新页面恢复全收起）
 let audioCtx = null;
 const tickerCache = Object.create(null);
 let currentTab = "group1";
@@ -372,10 +401,47 @@ recordPool = recordPool.filter(r => r.id!== id);
 saveRecords();
 renderRecordPool();
 }
+function toggleRecord(id) {
+if (expandedRecords.has(id)) expandedRecords.delete(id);
+else expandedRecords.add(id);
+renderRecordPool();
+}
 
 // ===== 记录有效期（按轨道区分：波段 7 天 / 短线 24 小时） =====
 function ttlFor(r) {
   return r && r.track === "SWING" ? SWING_TTL_MS : RECORD_TTL_MS;
+}
+
+// ===== 跟进提示（v3.3）：给记录池里的记录贴动作建议，纯页面显示，不推送 =====
+const BE_TRIGGER = 0.7; // 顺向走出「入场→TP1」路程的 70% 后，提示可推保本
+function followHint(r) {
+  if (!r || r.timeSL) return null;
+  if (r.ts && Date.now() - r.ts > ttlFor(r)) return null;
+  const be = Number.isFinite(r.entryMidVal) ? `入场 ${formatPrice(r.entryMidVal)}` : "入场价";
+  if (r.timeInv) return { cls: "bad", text: "跟进：情况不对 · 逻辑已失效，建议离场" };
+  if (r.timeTP3) return { cls: "good", text: "跟进：TP3 已到 · 可全部落袋离场" };
+  if (r.timeTP2) return { cls: "good", text: `跟进：TP2 已到 · 可继续减仓，余仓止损至少移到${be}` };
+  if (r.timeTP1) return { cls: "good", text: `跟进：TP1 已到 · 可减仓落袋，余仓止损可移到${be}` };
+  const mf = r.maxFav || 0;
+  if (mf >= BE_TRIGGER && Number.isFinite(r.entryMidVal)) {
+    return { cls: "mid", text: `跟进：已顺向走出约 ${Math.round(mf * 100)}% 路程 · 可推保本（止损移至${be}）` };
+  }
+  return null;
+}
+// favExtreme：本轮对持仓方向最有利的价格极值（多单传最高价、空单传最低价）；返回 true = 首次跨过推保本线，需保存+重渲染
+function updateMaxFav(r, favExtreme) {
+  if (!r || r.timeSL || r.timeTP1) return false;
+  if (!Number.isFinite(r.entryMidVal) || !Number.isFinite(r.tp1Val) || !Number.isFinite(favExtreme)) return false;
+  const denom = r.side === 'LONG' ? (r.tp1Val - r.entryMidVal) : (r.entryMidVal - r.tp1Val);
+  if (!(denom > 0)) return false;
+  const prog = r.side === 'LONG' ? (favExtreme - r.entryMidVal) / denom : (r.entryMidVal - favExtreme) / denom;
+  if (!Number.isFinite(prog)) return false;
+  const before = r.maxFav || 0;
+  if (prog > before) {
+    r.maxFav = Math.min(prog, 1.5);
+    return before < BE_TRIGGER && r.maxFav >= BE_TRIGGER;
+  }
+  return false;
 }
 
 // ===== 渲染记录池 =====
@@ -403,8 +469,10 @@ function renderRecordPool() {
         revLabel = item.side === 'LONG' ? ' (⚠️逆势吃反弹)' : ' (⚠️逆势吃回调)';
     }
 
+    const isOpen = expandedRecords.has(item.id);
     html += `
     <div class="record-item ${sideClass} ${warnClass}">
+      <div class="record-summary" onclick="toggleRecord('${item.id}')">
       <div class="record-top">
         <div>
           <span class="record-time">${item.timeStr}</span>
@@ -412,15 +480,22 @@ function renderRecordPool() {
             ${item.name} ${item.side === 'LONG' ? '✅做多' : '❌做空'}${revLabel}
           </span>
         </div>
-        <button class="btn-danger" onclick="deleteRecord('${item.id}')">删除</button>
+        <div>
+          <button class="btn-danger" onclick="event.stopPropagation();deleteRecord('${item.id}')">删除</button>
+          <span class="rec-arrow">${isOpen ? "▾" : "▸"}</span>
+        </div>
       </div>
-      
+      <div class="key-line">入场 <b>${item.entryText}</b> · 止损 <b style="color:var(--red)">${item.stopText}</b> · TP1 <b style="color:var(--green)">${item.tp1Text}</b></div>
+
       ${item.warnMsg ? `<div class="warn-tag">${item.warnMsg}</div>` : ""}
-      ${item.grade ? `<div class="grade-tag">级别：${item.grade}${item.grade === "超短线" && item.netDist !== null && item.netDist !== undefined ? ` · 扣费后净距离 ≈ ${item.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(item.netDist))}` : ""}</div>` : ""}
+      ${item.grade ? `<div class="grade-tag">级别：${item.grade}${item.etaText ? ` · 预计${item.etaText}` : ""}${item.grade === "超短线" && item.netDist !== null && item.netDist !== undefined ? ` · 扣费后净距离 ≈ ${item.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(item.netDist))}` : ""}</div>` : ""}
       ${item.track === "SWING" ? `<div class="swing-tag">波段单</div>` : ""}
       ${item.timeInv ? `<div class="invalid-tag">已失效 ${item.timeInv}（收盘越线）</div>` : ""}
       ${expired ? `<div class="expired-tag">已过期（${item.track === "SWING" ? "超 7 天" : "超 24 小时"}，不再追踪）</div>` : ""}
-      
+      ${(() => { const fh = followHint(item); return fh ? `<div class="follow-tag ${fh.cls}">${fh.text}</div>` : ""; })()}
+      </div>
+
+      <div class="record-detail" style="display:${isOpen ? "block" : "none"}">
       <div class="meta" style="margin-top:8px">
         <div class="meta-item">
           <div class="label">入场区间</div>
@@ -449,6 +524,7 @@ function renderRecordPool() {
       </div>
       <div class="reason" style="margin-top:8px; font-size:11px;">触发理由：${item.reasons}</div>
       ${item.invalidText ? `<div class="reason" style="margin-top:4px; font-size:11px;">失效（收盘）：${item.invalidText} · 止损（触价）：${item.stopText}</div>` : ""}
+      </div>
     </div>
     `;
   }
@@ -467,7 +543,8 @@ function checkRecordTriggers(symbolId, currentPrice, barHigh, barLow) {
     if (r.symbolId !== symbolId) continue;
     if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
     const isLong = r.side === 'LONG';
-    
+    if (updateMaxFav(r, isLong ? hi : lo)) changed = true;
+
     const hitSL = !r.timeSL && (isLong ? lo <= r.stopVal : hi >= r.stopVal);
     if (hitSL) {
       r.timeSL = now; changed = true;
@@ -565,12 +642,13 @@ function addRecordIfNeed(d) {
     riskPct: d.riskPct,
     warnMsg: d.warnMsg,
     grade: d.grade,
+    etaText: d.etaText !== undefined && d.etaText !== null ? d.etaText : null,
     netDist: d.netDist,
     invalidText: d.invalidText,
     track: d.track || "SHORT",
     invVal: d.invVal !== undefined ? d.invVal : null,
     invTf: d.invTf || "15m",
-    timeSL: null, timeTP1: null, timeTP2: null, timeTP3: null, timeInv: null
+    timeSL: null, timeTP1: null, timeTP2: null, timeTP3: null, timeInv: null, maxFav: 0
   };
   
   recordPool.push(rec);
@@ -874,7 +952,7 @@ function analyze(info, k4h, k1h, k15, k5, ticker) {
   
   // ===== 交易计划（顺势/逆势共用一套结构算法） =====
   let entry = null, stop = null, tp1 = null, tp2 = null, tp3 = null, rr = null;
-  let riskPct = 0, warnMsg = "", grade = null, netDist = null, invalidText = "";
+  let riskPct = 0, warnMsg = "", grade = null, netDist = null, etaText = null, invalidText = "";
   let invVal = null;
   
   if (side === "LONG" || side === "SHORT") {
@@ -922,6 +1000,8 @@ function analyze(info, k4h, k1h, k15, k5, ticker) {
         
         const tp1Pct = Math.abs(entryMid - tp1) / entryMid;
         grade = tp1Pct < GRADE_ULTRA ? "超短线" : tp1Pct <= GRADE_SHORT ? "短线" : "波段";
+        const geShort = gradeAndEta(Math.abs(entryMid - tp1), atr15, 15, grade);
+        grade = geShort.grade; etaText = geShort.etaText;
         if (grade === "超短线") netDist = Math.abs(entryMid - tp1) - entryMid * FEE_RT;
         
         invalidText = isLong
@@ -936,7 +1016,7 @@ function analyze(info, k4h, k1h, k15, k5, ticker) {
     name: info.name, symbolId: info.id, group: info.group, price, changePct, ticker, side, type, score,
     reasons: reasons.join(" · ") || "暂无明确信号",
     trend4, trend1, trend15, volOk, rsiValue, div,
-    entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade, netDist, invalidText,
+    entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade, netDist, etaText, invalidText,
     invVal, invTf: "15m",
     lastClose15: k15.closes[k15.closes.length - 1],
     lastClose1h: k1h.closes[k1h.closes.length - 1],
@@ -1033,7 +1113,8 @@ function analyzeSwing(info, k4h, k1h, k15, price) {
   if (tp1Pct <= GRADE_SHORT || rr < MIN_RR) return null;
 
   const warnMsg = riskPct > WIDE_STOP_PCT ? `⚠️ 止损过宽 ${(riskPct * 100).toFixed(1)}%` : "";
-  const grade = tp1Pct < GRADE_ULTRA ? "超短线" : tp1Pct <= GRADE_SHORT ? "短线" : "波段";
+  const grade = "波段";
+  const etaText = gradeAndEta(Math.abs(entryMid - tp1), atr1, 60, grade).etaText;
   const invalidText = isLong ? `1H 收盘跌破 ${formatPrice(level)}` : `1H 收盘站上 ${formatPrice(level)}`;
   const reasons = isLong
     ? `${trend4 === "BULL" ? "4H趋势偏多" : "4H中性"} · ${modeText} 1H 支撑 ${formatPrice(level)} · 15M 企稳确认`
@@ -1041,7 +1122,7 @@ function analyzeSwing(info, k4h, k1h, k15, price) {
 
   return {
     track: "SWING", side, type: `波段${isLong ? "做多" : "做空"} · ${modeText}`,
-    reasons, entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade,
+    reasons, entry, stop, tp1, tp2, tp3, rr, riskPct, warnMsg, grade, etaText,
     netDist: null, invalidText, invVal: level, invTf: "1h", score: null
   };
 }
@@ -1143,7 +1224,7 @@ function renderCard(d) {
     <div class="score">策略评分：${d.score.toFixed(1)}/5　多头 ${d.longScore.toFixed(1)} 分 / 空头 ${d.shortScore.toFixed(1)} 分</div>
     
     ${d.warnMsg ? `<div class="warn-tag">${d.warnMsg}</div>` : ""}
-    ${d.grade ? `<div class="grade-tag">级别：${d.grade}${d.grade === "超短线" && d.netDist !== null && d.netDist !== undefined ? ` · 扣费后净距离 ≈ ${d.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(d.netDist))}` : ""}</div>` : ""}
+    ${d.grade ? `<div class="grade-tag">级别：${d.grade}${d.etaText ? ` · 预计${d.etaText}` : ""}${d.grade === "超短线" && d.netDist !== null && d.netDist !== undefined ? ` · 扣费后净距离 ≈ ${d.netDist < 0 ? "-" : ""}${formatPrice(Math.abs(d.netDist))}` : ""}</div>` : ""}
     
     <div class="meta">
       <div class="meta-item"><div class="label">4H大趋势</div><div class="value">${trendText(d.trend4)}</div></div>
@@ -1210,7 +1291,7 @@ async function loadAll() {
           trend4: "NEUTRAL", trend1: "NEUTRAL", trend15: "NEUTRAL",
           volOk: false, rsiValue: null, div: { bull: false, bear: false },
           entry: null, stop: null, tp1: null, tp2: null, tp3: null, rr: null,
-          riskPct: null, warnMsg: null, grade: null, netDist: null, invalidText: "",
+          riskPct: null, warnMsg: null, grade: null, netDist: null, etaText: null, invalidText: "",
           invVal: null, invTf: "15m", lastClose15: null, lastClose1h: null, swing: null,
           longScore: 0, shortScore: 0, lastBarHigh: null, lastBarLow: null
         };
@@ -1420,40 +1501,30 @@ function handleWsMessage(raw) {
       for (const item of msg.d) {
         if (!item || typeof item !== "object") continue;
         const price = pickWsPrice(item);
-        if (price === null) continue;
-        onWsTick(symbolId, price, item);
+        if (price !== null) onWsTick(symbolId, price, item);
       }
     }
     return;
   }
-
-  // 兜底形状（旧方言兼容，正常用不到）：{arg:{channel,instId}, data:[...]} / {channel:"ticker.cmt_...", data:{...}}
-
-  let channel = "", instId = "";
-  if (msg.arg && typeof msg.arg === "object") {
-    channel = String(msg.arg.channel || "");
-    instId = String(msg.arg.instId || "");
+  // 兜底：旧版 v2 通道形状 {event:"push", channel:"ticker.cmt_btcusdt", data:{...}}，以及常见变体
+  let data = msg.data || msg.d || msg.tick || null;
+  let channel = "";
+  if (msg.arg && typeof msg.arg.channel === "string") channel = msg.arg.channel;
+  if (typeof msg.channel === "string") channel = msg.channel;
+  const chanSym = channel.replace("ticker.", "").replace("cmt_", "").toUpperCase();
+  if (chanSym && data && typeof data === "object" && !Array.isArray(data)) {
+    if (SYMBOLS.some(x => x.id === chanSym)) {
+      const price = pickWsPrice(data);
+      if (price !== null) onWsTick(chanSym, price, data);
+    }
+    return;
   }
-  if (typeof msg.channel === "string") {
-    if (!channel) channel = msg.channel;
-    const m = msg.channel.match(/^ticker\.(.+)$/);
-    if (m && !instId) instId = m[1];
-  }
-  if (channel && channel.indexOf("ticker") !== 0) return; // 只订阅了 ticker，其它频道不处理
-
-  let items = [];
-  if (Array.isArray(msg.data)) items = msg.data;
-  else if (msg.data && typeof msg.data === "object") items = [msg.data];
-  else items = [msg];
-
-  for (const item of items) {
-    if (!item || typeof item !== "object") continue;
-    const symRaw = instId || item.instId || item.symbol || item.s || "";
-    const symbolId = String(symRaw).toUpperCase().replace(/^CMT_/, "");
-    if (!SYMBOLS.some(s => s.id === symbolId)) continue;
-    const price = pickWsPrice(item);
-    if (price === null) continue;
-    onWsTick(symbolId, price);
+  if (data && typeof data === "object" && !Array.isArray(data) && typeof data.symbol === "string") {
+    const symbolId = data.symbol.toUpperCase();
+    if (SYMBOLS.some(x => x.id === symbolId)) {
+      const price = pickWsPrice(data);
+      if (price !== null) onWsTick(symbolId, price, data);
+    }
   }
 }
 
@@ -1501,6 +1572,7 @@ function checkRecordTriggersTick(symbolId, price) {
     if (r.symbolId !== symbolId) continue;
     if (r.ts && Date.now() - r.ts > ttlFor(r)) continue; // 已过期：不再追踪
     const isLong = r.side === 'LONG';
+    if (updateMaxFav(r, price)) changed = true;
     const hitSL = !r.timeSL && (isLong ? price <= r.stopVal : price >= r.stopVal);
     if (hitSL) {
       r.timeSL = now; changed = true;
